@@ -48,47 +48,53 @@ void TIM2_IRQHandler(void)
     }
 }
 		
-//通用定时器3中断初始化
-//这里时钟选择为APB1的2倍，而APB1为36M
+//通用定时器中断（时基）初始化，支持 TIM2/TIM3/TIM4
+//TIMx：定时器选择，仅支持 TIM2、TIM3、TIM4
 //arr：自动重装值。
 //psc：时钟预分频数
-//这里使用的是定时器3!
-
-void TIM3_Int_Init(u16 arr,u16 psc)
+void TIM_Int_Init(TIM_TypeDef* TIMx, u16 arr, u16 psc)
 {
   TIM_TimeBaseInitTypeDef  TIM_TimeBaseStructure;
-	RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE); //时钟使能
+
+	// 根据所选定时器使能对应时钟（均在 APB1 总线）
+	if (TIMx == TIM2)      RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM2, ENABLE);
+	else if (TIMx == TIM3) RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+	else if (TIMx == TIM4) RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+	else                   return;  // 不支持的定时器，直接返回
 	
-	TIM_TimeBaseStructure.TIM_Period = arr; //设置在下一个更新事件装入活动的自动重装载寄存器周期的值	 计数到5000为500ms
-	TIM_TimeBaseStructure.TIM_Prescaler =psc; //设置用来作为TIMx时钟频率除数的预分频值  10Khz的计数频率  
+	TIM_TimeBaseStructure.TIM_Period = arr; //设置在下一个更新事件装入活动的自动重装载寄存器周期的值
+	TIM_TimeBaseStructure.TIM_Prescaler =psc; //设置用来作为TIMx时钟频率除数的预分频值
 	TIM_TimeBaseStructure.TIM_ClockDivision = 0; //设置时钟分割:TDTS = Tck_tim
 	TIM_TimeBaseStructure.TIM_CounterMode = TIM_CounterMode_Up;  //TIM向上计数模式
-	TIM_TimeBaseInit(TIM3, &TIM_TimeBaseStructure); //根据TIM_TimeBaseInitStruct中指定的参数初始化TIMx的时间基数单位
+	TIM_TimeBaseInit(TIMx, &TIM_TimeBaseStructure); //根据指定参数初始化TIMx的时间基数单位
 	
-	TIM_ARRPreloadConfig(TIM3, ENABLE); //使能重装寄存器
-	TIM_Cmd(TIM3, ENABLE);  //使能TIMx外设					 
+	TIM_ARRPreloadConfig(TIMx, ENABLE); //使能重装寄存器
+	TIM_Cmd(TIMx, ENABLE);  //使能TIMx外设
 }
 
-void TIM3_CH_Init(u8 ch)
+//通用定时器PWM输出通道初始化，支持 TIM2/TIM3/TIM4
+//TIMx：定时器选择，仅支持 TIM2、TIM3、TIM4
+//ch：输出通道 1~4
+void TIM_CH_Init(TIM_TypeDef* TIMx, u8 ch)
 {
 	TIM_OCInitTypeDef TIM_OCInitStructure;
-	// 初始化TIM3_CH3的PWM模式
+	// 初始化TIMx对应通道的PWM模式
 	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
 	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
 	TIM_OCInitStructure.TIM_Pulse = 0;
 	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
 	if (ch == 1) {
-		TIM_OC1Init(TIM3, &TIM_OCInitStructure);					// 通道1使能
-		TIM_OC1PreloadConfig(TIM3, TIM_OCPreload_Enable); // 通道1预装载寄存器使能
+		TIM_OC1Init(TIMx, &TIM_OCInitStructure);					// 通道1使能
+		TIM_OC1PreloadConfig(TIMx, TIM_OCPreload_Enable); // 通道1预装载寄存器使能
 	} else if (ch == 2) {
-		TIM_OC2Init(TIM3, &TIM_OCInitStructure);					// 通道2使能
-		TIM_OC2PreloadConfig(TIM3, TIM_OCPreload_Enable); // 通道2预装载寄存器使能
-	}else if (ch == 3) {
-		TIM_OC3Init(TIM3, &TIM_OCInitStructure);					// 通道2使能
-		TIM_OC3PreloadConfig(TIM3, TIM_OCPreload_Enable); // 通道3预装载寄存器使能
+		TIM_OC2Init(TIMx, &TIM_OCInitStructure);					// 通道2使能
+		TIM_OC2PreloadConfig(TIMx, TIM_OCPreload_Enable); // 通道2预装载寄存器使能
+	} else if (ch == 3) {
+		TIM_OC3Init(TIMx, &TIM_OCInitStructure);					// 通道3使能
+		TIM_OC3PreloadConfig(TIMx, TIM_OCPreload_Enable); // 通道3预装载寄存器使能
 	} else if (ch == 4) {
-		TIM_OC4Init(TIM3, &TIM_OCInitStructure);					// 通道4使能
-		TIM_OC4PreloadConfig(TIM3, TIM_OCPreload_Enable); // 通道4预装载寄存器使能 
+		TIM_OC4Init(TIMx, &TIM_OCInitStructure);					// 通道4使能
+		TIM_OC4PreloadConfig(TIMx, TIM_OCPreload_Enable); // 通道4预装载寄存器使能 
 	}
 }
 
@@ -101,6 +107,14 @@ void TIM3_IRQHandler(void)   //TIM3中断
 		}
 }
 
+//定时器3中断服务程序
+void TIM4_IRQHandler(void)   //TIM3中断
+{
+	if (TIM_GetITStatus(TIM4, TIM_IT_Update) != RESET) //检查指定的TIM中断发生与否:TIM 中断源 
+		{
+		TIM_ClearITPendingBit(TIM4, TIM_IT_Update  );  //清除TIMx的中断待处理位:TIM 中断源 
+		}
+}
 
 
 

@@ -1,114 +1,27 @@
 #include "func.h"
+#include "expression.h"
 
  
-void handle_heartbeat(void)
-{
-	printf("heartbeat handle\r\n");
-	BLE_SendFrame(CMD_HEARTBEAT, NULL, 0);
-}
-
 void handle_leg_reset(void)
 {
+	Servo_Head(90);   // PB0 头 占空比2.5%，0度
+	Servo_Tail(90);   // PB1 尾 占空比2.5%，0度
+	Servo_Leg_FL(90);  // PB6 左前腿
+  Servo_Leg_FR(90);  // PB7 右前腿
+  Servo_Leg_BL(90);  // PB8 左后腿
+  Servo_Leg_BR(90);  // PB9 右后腿
+	delay_ms(1000);
 	printf("leg_reset handle\r\n");
 }
 
-u8 g_current_expr_id =0;
-u8 g_expr_dirty =0 ;
-u8 g_target_expr_id =0;
-
-/* ==================== 表情绘制 ====================
- * 全部用图元直接写入 OLED_GRAM，不保存任何位图数组(0额外字节RAM/Flash)。
- * 纯整数运算，不使用<math.h>与浮点。绘制后统一由 OLED_Refresh() 刷新一次。
- * 画布 128x64，左眼中心(40,24) 右眼中心(88,24) 嘴中心 x=64
+/* ==================== 表情调度 ====================
+ * 具体绘制在expression.c,这里只做分发与刷新时机控制
  */
-static void expr_dot(int x, int y)                 /* 带越界保护的画点 */
-{
-	if(x >= 0 && x < 128 && y >= 0 && y < 64)
-		OLED_DrawPoint((u8)x, (u8)y, 1);
-}
-
-static void expr_fill_circle(int cx, int cy, int r)/* 实心圆 */
-{
-	int dx, dy;
-	for(dy = -r; dy <= r; dy++)
-		for(dx = -r; dx <= r; dx++)
-			if(dx*dx + dy*dy <= r*r) expr_dot(cx + dx, cy + dy);
-}
-
-static void expr_ring(int cx, int cy, int r)       /* 约2px厚空心圆 */
-{
-	int dx, dy, d;
-	for(dy = -r; dy <= r; dy++)
-		for(dx = -r; dx <= r; dx++){
-			d = dx*dx + dy*dy;
-			if(d <= r*r && d >= (r-2)*(r-2)) expr_dot(cx + dx, cy + dy);
-		}
-}
-
-static void expr_line(int x0, int y0, int x1, int y1)/* Bresenham直线 */
-{
-	int dx = x1 - x0, dy = y1 - y0;
-	int sx = (dx >= 0) ? 1 : -1;
-	int sy = (dy >= 0) ? 1 : -1;
-	int err, e2;
-	if(dx < 0) dx = -dx;
-	if(dy < 0) dy = -dy;
-	err = dx - dy;
-	while(1){
-		expr_dot(x0, y0);
-		if(x0 == x1 && y0 == y1) break;
-		e2 = 2 * err;
-		if(e2 > -dy){ err -= dy; x0 += sx; }
-		if(e2 <  dx){ err += dx; y0 += sy; }
-	}
-}
-
-static void expr_line_thick(int x0,int y0,int x1,int y1,int t)/* 加粗直线(横向偏移t) */
-{
-	int i;
-	for(i = -t; i <= t; i++)
-		expr_line(x0 + i, y0, x1 + i, y1);
-}
-
-static void expr_mouth(int cx, int cy, int hw, int depth, int dir)
-{
-	int dx, k, dy;                         /* 抛物线嘴: dir>0微笑U, dir<0撇嘴∩ */
-	for(dx = -hw; dx <= hw; dx++){
-		dy = (dx * dx * depth) / (hw * hw);
-		for(k = 0; k < 2; k++)
-			if(dir > 0) expr_dot(cx + dx, cy + dy + k);
-			else        expr_dot(cx + dx, cy - dy - k);
-	}
-}
-
-static void expr_face_happy(void)         /* 开心: 弯弯笑眼 + U形笑嘴 */
-{
-	expr_line(32, 28, 40, 20); expr_line(40, 20, 48, 28);   /* 左眼 ^ */
-	expr_line(80, 28, 88, 20); expr_line(88, 20, 96, 28);   /* 右眼 ^ */
-	expr_mouth(64, 38, 20, 12, 1);                          /* 微笑 */
-}
-
-static void expr_face_cry(void)           /* 哭泣: 圆眼 + 泪滴 + 撇嘴 */
-{
-	expr_fill_circle(40, 24, 5); expr_fill_circle(88, 24, 5);   /* 眼睛 */
-	expr_line_thick(40, 30, 40, 44, 1); expr_fill_circle(40, 47, 3);/* 左泪 */
-	expr_line_thick(88, 30, 88, 44, 1); expr_fill_circle(88, 47, 3);/* 右泪 */
-	expr_mouth(64, 54, 16, 9, -1);                               /* 撇嘴 */
-}
-
-static void expr_face_daze(void)          /* 发呆: 大瞪眼(空心圈+瞳点) + O形嘴 */
-{
-	expr_ring(40, 24, 9); expr_fill_circle(40, 24, 2);   /* 左瞪眼 */
-	expr_ring(88, 24, 9); expr_fill_circle(88, 24, 2);   /* 右瞪眼 */
-	expr_ring(64, 46, 4);                                /* O形嘴 */
-}
-
-static void expr_face_angry(void)         /* 生气: 倒八字眉 + 小眼 + 撇嘴 */
-{
-	expr_line_thick(30, 14, 50, 24, 1); expr_line_thick(98, 14, 78, 24, 1);/* 眉毛 \\ / */
-	expr_fill_circle(42, 30, 4); expr_fill_circle(86, 30, 4);               /* 眼睛 */
-	expr_mouth(64, 56, 18, 10, -1);                                        /* 撇嘴 */
-}
+/* 表情状态(跨模块共享,extern声明见expression.h) */
+u8 g_current_expr_id = 0;
+u8 g_expr_dirty = 0;
+u8 g_target_expr_id = 0;
+signed char g_expr_shift = 0;   /* 正常表情水平偏移px(转弯联动用) */
 
 void handle_expression(void)
 {
@@ -118,9 +31,93 @@ void handle_expression(void)
 		case EXP_CRY:   expr_face_cry();   break;
 		case EXP_DAZE:  expr_face_daze();  break;
 		case EXP_ANGRY: expr_face_angry(); break;
+		case EXP_SLEEP: expr_face_sleep(); break;
+		case EXP_NORMAL: expr_face_normal(); break;
 		default:        expr_face_daze();  break;
 	}
 	OLED_Refresh();                      /* 一次性把表情刷到屏上 */
+}
+
+void handle_sleep(void)
+{
+	printf("Sleep command\r\n");
+	/* 待机:停止动作并显示睡眠表情 */
+	g_action_state = ACTION_IDLE;
+	if (g_current_expr_id != EXP_SLEEP)
+	{
+		g_target_expr_id = EXP_SLEEP;
+		g_expr_dirty     = 1;
+	}
+}
+
+/* ==================== 转弯表情联动 ====================
+ * 收到转向指令: 表情切为正常款并向旋转方向偏移10px(右+10/左-10)
+ * 停止转向(回中/5s超时/切其他动作): 偏移回正,1秒后恢复转弯前原表情
+ * 非阻塞:回正计时由主循环每轮调用的handle_expr_return轮询 */
+static u8      s_turn_expr_active = 0;   /* 联动模式进行中 */
+static u8      s_turn_orig_expr   = 0;   /* 进入转弯前的表情ID */
+static uint32_t s_expr_return_tick = 0;  /* !=0:已回正,待1s后恢复原表情 */
+
+static void turn_expr_enter(signed char shift)
+{
+	if (!s_turn_expr_active)
+	{
+		s_turn_orig_expr   = g_current_expr_id;  /* 记下转弯前表情 */
+		s_turn_expr_active = 1;
+	}
+	s_expr_return_tick = 0;                    /* 转弯中取消回表计时 */
+	if (g_expr_shift != shift || g_target_expr_id != EXP_NORMAL)
+	{
+		g_expr_shift     = shift;
+		g_target_expr_id = EXP_NORMAL;
+		g_expr_dirty     = 1;
+	}
+}
+
+static void turn_expr_exit(void)
+{
+	if (!s_turn_expr_active) return;
+	s_turn_expr_active = 0;
+	g_expr_shift       = 0;                    /* 表情回正 */
+	g_target_expr_id   = EXP_NORMAL;           /* 回正后先显示居中的正常脸 */
+	g_expr_dirty       = 1;
+	s_expr_return_tick = g_sys_tick_ms;        /* 1s后恢复原表情 */
+}
+
+void handle_expr_return(void)
+{
+	if (s_expr_return_tick == 0) return;
+	if (g_sys_tick_ms - s_expr_return_tick < 1000)
+		return;
+	s_expr_return_tick = 0;
+	if (g_target_expr_id != EXP_NORMAL)
+		return;   /* 等待期间用户已手动切其他表情,取消自动恢复 */
+	g_target_expr_id = s_turn_orig_expr;       /* 恢复转弯前表情 */
+	g_expr_shift     = 0;
+	g_expr_dirty = 1;
+}
+
+/* ==================== 通信超时保护 ====================
+ * 5s 未收到心跳/有效指令: 停止所有动作(只执行一次)
+ * 10min 未收到心跳/有效指令: 进入待机 handle_sleep(),并刷新计时避免重复触发
+ * last_valid_tick: 最近一次收到有效帧(心跳或正确指令)的时刻,由主循环维护
+ */
+void handle_timeout_guard(u32 *last_valid_tick)
+{
+	u32 elapsed = g_sys_tick_ms - *last_valid_tick;
+
+	if (elapsed >= 5000 && g_action_state != ACTION_IDLE)
+	{
+		g_action_state = ACTION_IDLE;   /* 停止所有动作 */
+		turn_expr_exit();               /* 转弯联动表情同步回正并计时恢复 */
+		printf("Timeout 5s: all actions stopped\r\n");
+	}
+
+	if (elapsed >= 10u * 60u * 1000u)
+	{
+		handle_sleep();                 /* 进入待机 */
+		*last_valid_tick = g_sys_tick_ms; /* 重置计时,避免每轮重复触发 */
+	}
 }
 
 void handle_reboot(void)
@@ -129,28 +126,208 @@ void handle_reboot(void)
   NVIC_SystemReset();
 }
 
+/* 摇杆指令: dataX=水平(左0~右255), dataY=垂直(后0~前255), 中心约128
+ * 改用"带符号偏移+主轴判定": 先取偏离中心更远的主轴决定动作,
+ * 斜向滑动不再被固定阈值误判成其他方向(修复右滑Y分量提前命中前后判定、
+ * 以及X未超过固定阈值导致右转不触发的问题) */
 void handle_joystick(u8 dataX, u8 datay)
 {
-	printf("reboot handle\r\n");
+	int dx = (int)dataX - 128;   /* >0 右, <0 左 */
+	int dy = (int)datay - 128;   /* >0 前, <0 后 */
+	int adx = (dx < 0) ? -dx : dx;
+	int ady = (dy < 0) ? -dy : dy;
+
+	if (adx < 25 && ady < 25)   /* 双轴都在死区内: 回中停 */
+	{
+		g_action_state = ACTION_IDLE;
+		turn_expr_exit();             /* 停止转弯:表情回正,1s后恢复原表情 */
+		return;
+	}
+
+	if (adx > ady)              /* 水平为主: 前后(按要求与垂直轴对调) */
+	{
+		turn_expr_exit();             /* 非转弯指令:退出联动(若激活则回正计时) */
+		if (dx > 0) {Joy_Right();turn_expr_enter(10); } /* 右滑*/
+		else        {Joy_Left(); turn_expr_enter(-10); }   /* 左滑 */
+	} else {                    /* 垂直为主: 转向 */
+		if (dy > 0) { Joy_Up();     }  /* 上推右转:脸右偏10px */
+		else        { Joy_Down(); }  /* 下拉左转:脸左偏10px */
+	}
 }
+
+/* ==================== 摇头指令 0x21 ====================
+ * 通过PB6头舵机(SG90, TIM4_CH1 PWM)执行: 以收到角度为中心左右各摆30°,
+ * 往复一次后回到中心角。运行时填充一段RAM脚本交给非阻塞引擎播放,
+ * 不卡主循环,5s超时保护照常生效。角度限幅30~150(留足摆动余量) */
+static ServoStep s_scr_heading[5];              /* 运行时填充的摇头脚本 */
+static void Servo_PlayScript(const ServoStep *steps, u8 len, u8 loop); /* 前置声明(定义在后文脚本引擎) */
 
 void handle_heading(u8 angle)
 {
-	printf("action heading\r\n");
+	ServoStep *sc = s_scr_heading;
+
+	if (angle < 30)  angle = 30;                /* 限幅:保证±30°不撞机械限位 */
+	if (angle > 150) angle = 150;
+
+	sc[0].head = angle - 30;  sc[0].t = 300;    /* 左摆 */
+	sc[1].head = angle + 30;  sc[1].t = 300;    /* 右摆 */
+	sc[2].head = angle - 30;  sc[2].t = 300;    /* 再左摆 */
+	sc[3].head = angle + 30;  sc[3].t = 300;    /* 再右摆 */
+	sc[4].head = angle;       sc[4].t = 200;    /* 回中心角 */
+	/* tail/四腿字段保持static零初始化(=0表示本步不动作) */
+
+	Servo_PlayScript(s_scr_heading, 5, 0);      /* 单次执行,不循环 */
+	printf("heading shake, base angle=%d via PB6\r\n", angle);
 }
 
 
+/* ==================== 电量 ====================
+ * 电量百分比(0~100),暂固定为 0,待接入 ADC 分压采样后由采样任务更新
+ * 预留接口:后续在 ADC 采样中将电压换算为百分比写入 g_battery_level
+ */
+u8 g_battery_level = 0;
+
+/* 心跳应答:返回状态帧 CMD_STATUS_REPORT(0x41),含电量信息
+ * 数据域(4字节): [0]电量%  [1]动作状态  [2]当前表情  [3]通信状态(1=在线)
+ */
 void handle_status_req(void)
 {
 	u8 status[4] = {0};
-  /* TODO: 填充实际状态：电量、模式、使能、连接状态 */
-  BLE_SendFrame(CMD_STATUS_REPORT, status, 4);
-	// printf("status_req handle\r\n");
+	status[0] = g_battery_level;              /* 电量百分比(暂为0) */
+	status[1] = (u8)g_action_state;           /* 当前动作状态 */
+	status[2] = g_current_expr_id;            /* 当前表情ID */
+	status[3] = 1;                            /* 通信状态:能应答即在线 */
+	BLE_SendFrame(CMD_STATUS_REPORT, status, 4);
+	printf("status_req handle, battery=%d%%\r\n", g_battery_level);
 }
 
 ActionState g_action_state = ACTION_IDLE;
 uint32_t    g_action_start_tick = 0;
 u8     g_action_param = 0;
+
+/* ==================== 动作脚本库 ====================
+ * 约定: 90=中位/站立, 120=前/抬起, 60=后/压下, 0=本步该轴不动
+ * STEP(头,尾,左前,右前,左后,右后,保持ms)
+ * 因实际舵机安装方向可能相反,若某动作方向反了,把对应的120/60对调即可
+ */
+#define STEP(h, t, fl, fr, bl, br, ms)  { h, t, fl, fr, bl, br, (StepMs)(ms) }
+#define SCRIPT_LEN(a)  ((u8)(sizeof(a) / sizeof((a)[0])))
+
+/* ---- 运动(循环步态) ---- 数组名对应摇杆手势: fwd=上推 back=下拉 left=左滑 right=右滑
+ * (名字跟手势,具体物理动作见各行注释,数据与手势互换前一致) */
+static const ServoStep scr_walk_fwd[] = {   /* 上推手势触发: 物理右转步态 */
+    STEP(90,90,  60,120,  60,120,  300),
+    STEP(90,90,  90, 90,  90, 90,  150),
+};
+static const ServoStep scr_walk_back[] = {  /* 下拉手势触发: 物理左转步态 */
+    STEP(90,90, 120, 60, 120, 60,  300),
+    STEP(90,90,  90, 90,  90, 90,  150),
+};
+static const ServoStep scr_turn_right[] = { /* 右滑手势触发: 物理前进对角步态 */
+    STEP(90,90,  60,120, 120, 60,  300),
+    STEP(90,90, 120, 60,  60,120,  300),
+};
+static const ServoStep scr_turn_left[] = {  /* 左滑手势触发: 物理后退步态 */
+    STEP(90,90, 120, 60,  60,120, 300),
+    STEP(90,90,  60,120, 120, 60,  300),
+};
+
+/* ---- 姿势(单次执行) ---- */
+static const ServoStep scr_stand[] = {        /* 站立 */
+    STEP(90,90, 90,90, 90,90, 500),
+};
+static const ServoStep scr_sit[] = {          /* 坐下:后腿前收 */
+    STEP(90,90, 90,90, 30,150, 600),
+};
+static const ServoStep scr_lie_forward[] = {  /* 趴下:前脚向前,后脚向后 */
+    STEP(120,90, 150,30, 150,30, 600),
+};
+static const ServoStep scr_lie_back[] = {     /* 后躺:前脚向前,后脚向前 */
+    STEP(90,150, 30,150, 30,150, 600),
+};
+
+static const ServoStep scr_shake_head[] = {   /* 摇头 30~120 往复 */
+    STEP(30, 0, 0,0,0,0, 300),
+    STEP(120,0, 0,0,0,0, 300),
+    STEP(30, 0, 0,0,0,0, 300),
+    STEP(120,0, 0,0,0,0, 300),
+    STEP(90, 0, 0,0,0,0, 300),
+};
+static const ServoStep scr_wag_tail[] = {     /* 摇尾 60~120 往复 */
+    STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+    STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+    STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+		STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+    STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+    STEP(0, 40, 0,0,0,0, 150),
+    STEP(0,140, 0,0,0,0, 150),
+    STEP(0, 90, 0,0,0,0, 100),
+};
+static const ServoStep scr_mark[] = {         /* 标记:先坐下,右后腿向后伸 */
+    STEP(90,90, 90,90, 90,90, 500),        /* 站 */
+    STEP(0, 0,   0, 0,   0, 30,  800),        /* 右后腿向后伸(br=60) */
+    STEP(0, 0,   0, 0,   0,90,  400),        /* 收回 */
+};
+static const ServoStep scr_handshake[] = {    /* 握手:左前腿向前伸 */
+    STEP(90,90, 90, 90, 90,90, 300),         /* 先站定 */
+    STEP(0, 0, 30,  0,  0,  0, 700),         /* 左前腿前伸 */
+    STEP(0, 0, 60,  0,  0,  0, 300),         /* 轻摆 */
+    STEP(0, 0, 30,  0,  0,  0, 300),
+    STEP(0, 0,  90,  0,  0,  0, 300),         /* 收回 */
+};
+
+/* ---- 脚本播放游标(文件内部) ---- */
+static const ServoStep *s_script     = NULL;
+static u8   s_script_len = 0;
+static u8   s_script_idx = 0;
+static u8   s_script_loop = 0;
+static uint32_t s_step_tick = 0;
+
+/* 播放一段脚本;loop=1循环(步态),loop=0执行一遍后回空闲
+ * 若已在播放同一循环脚本(摇杆持续同方向),不重置相位 */
+static void Servo_PlayScript(const ServoStep *steps, u8 len, u8 loop)
+{
+    if (loop && g_action_state == ACTION_SCRIPT && s_script == steps && s_script_loop)
+        return;
+    s_script      = steps;
+    s_script_len  = len;
+    s_script_idx  = 0;
+    s_script_loop = loop;
+    Servo_RunStep(&s_script[0]);
+    s_step_tick = g_sys_tick_ms;
+    g_action_state = ACTION_SCRIPT;
+    g_action_start_tick = g_sys_tick_ms;
+}
+
+/* CMD_ACTION(0x30) 动作码 → 姿势脚本分发 */
+void handle_action_cmd(u8 act_val)
+{
+    switch (act_val)
+    {
+    case ACT_STAND:       Servo_PlayScript(scr_stand,       SCRIPT_LEN(scr_stand),       0); break;
+    case ACT_SIT_DOWN:    Servo_PlayScript(scr_sit,         SCRIPT_LEN(scr_sit),         0); break;
+    case ACT_LIE_FORWARD: Servo_PlayScript(scr_lie_forward, SCRIPT_LEN(scr_lie_forward), 0); break;
+    case ACT_LIE_BACK:    Servo_PlayScript(scr_lie_back,    SCRIPT_LEN(scr_lie_back),    0); break;
+    case ACT_SHAKE_HEAD:  Servo_PlayScript(scr_shake_head,  SCRIPT_LEN(scr_shake_head),  0); break;
+    case ACT_WAG_TAIL:    Servo_PlayScript(scr_wag_tail,    SCRIPT_LEN(scr_wag_tail),    0); break;
+    case ACT_MARK:        Servo_PlayScript(scr_mark,        SCRIPT_LEN(scr_mark),        0); break;
+    case ACT_WAVE:        Servo_PlayScript(scr_handshake,   SCRIPT_LEN(scr_handshake),   0); break;
+    default:
+        printf("No program for action 0x%02X\r\n", act_val);
+        break;
+    }
+}
+
+/* ---- 摇杆手势→步态接口(名字=触发手势,数组名同为手势方向,注释=物理动作) ---- */
+void Joy_Right(void) { Servo_PlayScript(scr_turn_right, SCRIPT_LEN(scr_turn_right), 1); }  /* 右滑→前进 */
+void Joy_Left(void)  { Servo_PlayScript(scr_turn_left,  SCRIPT_LEN(scr_turn_left),  1); }  /* 左滑→后退 */
+void Joy_Up(void)    { Servo_PlayScript(scr_walk_fwd,   SCRIPT_LEN(scr_walk_fwd),   1); }  /* 上推→右转 */
+void Joy_Down(void)  { Servo_PlayScript(scr_walk_back,  SCRIPT_LEN(scr_walk_back),  1); }  /* 下拉→左转 */
 
 /* ==================== 非阻塞动作执行器 ==================== */
 /*
@@ -164,62 +341,69 @@ u8 handle_action(void)
     case ACTION_IDLE:
         return 0;
 
+    case ACTION_SCRIPT:
+        /* 当前步保持时间到,推进到下一步 */
+        if (g_sys_tick_ms - s_step_tick >= s_script[s_script_idx].t)
+        {
+            s_script_idx++;
+            if (s_script_idx >= s_script_len)
+            {
+                if (s_script_loop)
+                {
+                    s_script_idx = 0;             /* 步态循环 */
+                }
+                else
+                {
+                    g_action_state = ACTION_IDLE;  /* 姿势完成,保持末态 */
+                    return 0;
+                }
+            }
+            Servo_RunStep(&s_script[s_script_idx]);
+            s_step_tick = g_sys_tick_ms;
+        }
+        return 1;
+
     case ACTION_LEG_RESET:
-        /* 示例：复位动作持续 500ms，分 5 步执行，每步 100ms */
-        if (g_sys_tick_ms - g_action_start_tick < 500)
-        {
-            /* 每 100ms 执行一步舵机调整 */
-            if ((g_sys_tick_ms - g_action_start_tick) % 100 == 0)
-            {
-                /* TODO: 在这里写入单步舵机控制代码 */
-                /* 例如：Servo_SetAngle(leg_id, target_angle); */
-            }
-            return 1; /* 仍在执行 */
-        }
-        else
-        {
-            g_action_state = ACTION_IDLE; /* 动作完成 */
-            printf("Leg reset completed\r\n");
-            return 0;
-        }
-
     case ACTION_CUSTOM:
-        /* 示例：自定义动作持续 300ms */
-        if (g_sys_tick_ms - g_action_start_tick < 300)
-        {
-            if ((g_sys_tick_ms - g_action_start_tick) % 100 == 0)
-            {
-                /* TODO: 根据 g_action_param 执行对应动作单步 */
-            }
-            return 1;
-        }
-        else
-        {
-            g_action_state = ACTION_IDLE;
-            printf("Action 0x%02X completed\r\n", g_action_param);
-            return 0;
-        }
-
     default:
         g_action_state = ACTION_IDLE;
         return 0;
     }
 }
 
- 
+/* 表情轮播测试: 依次展示6个表情,每个3秒 */
+void Expression_Test(void)
+{
+	u8 ids[6] = {EXP_NORMAL, EXP_HAPPY, EXP_CRY, EXP_DAZE, EXP_ANGRY, EXP_SLEEP};
+	u8 i;
+	for(i = 0; i < 6; i++)
+	{
+		g_target_expr_id = ids[i];
+		handle_expression();
+		delay_ms(3000);
+	}
+}
+	
+
  // 硬件功能验证函数
  void Servo_Test(void)
  {
-	//SG90_Set_Angle(0, 1);  //占空比2.5%，0度
-	//SG90_Set_Angle(0, 2);  //占空比2.5%，0度
-	SG90_Set_Angle(0, 3);  //占空比2.5%，0度
-	SG90_Set_Angle(0, 4);  //占空比2.5%，0度
+	Servo_Head(0);   // PB0 头 占空比2.5%，0度
+	Servo_Tail(0);   // PB1 尾 占空比2.5%，0度
+	Servo_Leg_FL(0);  // PB6 左前腿
+    Servo_Leg_FR(0);  // PB7 右前腿
+    Servo_Leg_BL(0);  // PB8 左后腿
+    Servo_Leg_BR(0);  // PB9 右后腿
 	delay_ms(1000);
-	//SG90_Set_Angle(30, 1);  //占空比2.5%，0度
-	//SG90_Set_Angle(60, 2);  //占空比2.5%，0度
-	SG90_Set_Angle(180, 3);  //占空比7.5%，90度
-	SG90_Set_Angle(180, 4);  //占空比7.5%，90度
+	  LED0 = !LED0;
+	Servo_Head(60); // PB0 头 占空比7.5%，90度
+	Servo_Tail(60); // PB1 尾 占空比7.5%，90度
+	Servo_Leg_FL(60);  // PB6 左前腿
+    Servo_Leg_FR(60);  // PB7 右前腿
+    Servo_Leg_BL(60);  // PB8 左后腿
+    Servo_Leg_BR(60);  // PB9 右后腿
 	delay_ms(1000); 
+	 LED0 = !LED0;
  }
  void OLed_Test(void)
 {

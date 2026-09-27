@@ -1,4 +1,5 @@
 #include "func.h"
+#include "expression.h"
 /************************************************
 
 ************************************************/
@@ -27,25 +28,21 @@
 	OLED_Display_On();
 	OLED_Clear();
 	OLED_DisplayTurn(1);
-	 
-	OLed_Test();
 
+	//Expression_Test();
 	/* 开机默认显示"发呆"表情，之后由蓝牙CMD_EXPRESSION(0x31)切换 */
-	g_target_expr_id  = EXP_DAZE;
+	g_target_expr_id  = EXP_SLEEP;
 	handle_expression();
 	g_current_expr_id = g_target_expr_id;
-
-	// 初始化舵机角度
-	//SG90_Set_Angle(0, 1);  //占空比2.5%，0度
-	//SG90_Set_Angle(0, 2);  //占空比2.5%，0度
-	SG90_Set_Angle(0, 3);  //占空比2.5%，0度
-	SG90_Set_Angle(0, 4);  //占空比2.5%，0度
-	delay_ms(1000);
 	
+	
+	// 初始化舵机角
+	handle_leg_reset();
+	//Servo_Test();
 	 // ===== 各任务时间戳 ===== 
-	u32 last_heartbeat_tick = 0;
 	u32 last_status_tick  = 0;
 	u32 last_expr_refresh_tick = 0;
+	u32 last_valid_tick = 0;   /* 最近一次收到心跳/有效指令的时刻 */
 	ParsedFrame frame;
 	
 	while(1)
@@ -56,17 +53,20 @@
 		 while (BLE_PollFrame(&frame))
      {
 			 printf("recv cmd=[%d]\r\n", frame.cmd);
+			 last_valid_tick = g_sys_tick_ms;  /* 收到有效帧,刷新超时计时 */
 			 switch (frame.cmd)
 			 {
             case CMD_HEARTBEAT:
-                BLE_SendFrame(CMD_HEARTBEAT, NULL, 0);
+                /* 收到心跳后返回电量和状态 */
+                handle_status_req();
                 break;
 
             case CMD_LEG_RESET:
-                printf("Leg reset triggered\r\n");
-                // 只触发状态，不阻塞 
-                g_action_state      = ACTION_LEG_RESET;
-                g_action_start_tick = g_sys_tick_ms;
+                if (frame.data_len >= 1)
+                {
+                    printf("LEG_RESET/ACT_STAND 0x%02X triggered\r\n", frame.data[0]);
+                    handle_action_cmd(ACT_STAND); /* 分发到对应姿势脚本 */
+                }
                 break;
 
             case CMD_REBOOT:
@@ -76,6 +76,7 @@
             case CMD_JOYSTICK:
                 if (frame.data_len >= 2)
                 {
+					printf("joystick [0x%02X : 0x%02X]triggered\r\n", frame.data[0], frame.data[1]);
                    handle_joystick(frame.data[0], frame.data[1]);
                 }
                 break;
@@ -83,6 +84,7 @@
             case CMD_HEADING:
                 if (frame.data_len >= 1)
                 {
+					printf("Action 0x%02X triggered\r\n", frame.data[0]);
                     handle_heading(frame.data[0]);
                 }
                 break;
@@ -91,9 +93,7 @@
                 if (frame.data_len >= 1)
                 {
                     printf("Action 0x%02X triggered\r\n", frame.data[0]);
-                    g_action_state      = ACTION_CUSTOM;
-                    g_action_start_tick = g_sys_tick_ms;
-                    g_action_param      = frame.data[0];
+                    handle_action_cmd(frame.data[0]); /* 分发到对应姿势脚本 */
                 }
                 break;
 
@@ -120,33 +120,33 @@
                 break;
 				}
 		 }
-		  // ===== 任务1：周期性心跳（2s） ===== 
-      if (g_sys_tick_ms - last_heartbeat_tick >= 5000)
-      {
-				last_heartbeat_tick = g_sys_tick_ms;
-				handle_heartbeat();
-      }
 
-      // (g_sys_tick_ms - last_status_tick >= 1000)
-      {
-         last_status_tick = g_sys_tick_ms;
-		 printf("rx=%u pop=%u head=%u tail=%u state=%d\r\n",
-                g_isr_rx_cnt, g_pop_cnt, g_ble_ring.head, g_ble_ring.tail, g_parse_state_dbg);
-         handle_status_req();
-      }
-		  // ===== 任务3：动作状态机调度 ===== 
-			handle_action();
-			// ===== 任务4：表情刷新调度 ===== 
-			if (g_expr_dirty) {
-				if (g_sys_tick_ms - last_expr_refresh_tick >= 50)
-				{
-						last_expr_refresh_tick = g_sys_tick_ms;
-						handle_expression();
-						// 3. 刷新完成，更新状态 
-            g_current_expr_id = g_target_expr_id;
-            g_expr_dirty = 0; // 清除脏标记 
-				}
+		// ===== 任务2：通信超时保护（5s停动作 / 10min待机） ===== 
+		handle_timeout_guard(&last_valid_tick);
+
+		// ===== 任务2.5：转弯表情回正1s后恢复原表情(非阻塞轮询) ===== 
+		handle_expr_return();
+
+		// (g_sys_tick_ms - last_status_tick >= 1000)
+		{
+			last_status_tick = g_sys_tick_ms;
+			//printf("rx=%u pop=%u head=%u tail=%u state=%d\r\n",
+		//           g_isr_rx_cnt, g_pop_cnt, g_ble_ring.head, g_ble_ring.tail, g_parse_state_dbg);
+			// 状态上报已由心跳应答触发,此处不再周期发送
+		}
+		// ===== 任务3：动作状态机调度 ===== 
+		handle_action();
+		// ===== 任务4：表情刷新调度 ===== 
+		if (g_expr_dirty) {
+			if (g_sys_tick_ms - last_expr_refresh_tick >= 50)
+			{
+				last_expr_refresh_tick = g_sys_tick_ms;
+				handle_expression();
+				// 3. 刷新完成，更新状态 
+				g_current_expr_id = g_target_expr_id;
+				g_expr_dirty = 0; // 清除脏标记 
 			}
+		}
 
 	}
  }

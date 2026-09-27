@@ -51,6 +51,8 @@ typedef enum {
     EXP_CRY     = 0x01,
     EXP_DAZE    = 0x02,
     EXP_ANGRY   = 0x03,
+    EXP_SLEEP   = 0x04,
+    EXP_NORMAL  = 0x05,  /* 正常: 圆角正方形双眼(追加,不影响旧ID) */
 } ExpressionType;
 
 /* ==================== 解析结果结构体 ==================== */
