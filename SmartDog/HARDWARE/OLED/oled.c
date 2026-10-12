@@ -156,8 +156,8 @@ void OLED_Refresh(void)
 	 uint8_t i,n;
     for (i = 0; i < 8; i++) {
         OLED_WR_Cmd(0xB0 + i);
-        OLED_WR_Cmd(0x00);       // ????
-        OLED_WR_Cmd(0x10);       // ????
+        OLED_WR_Cmd(0x02);       // 列地址低4位=2(SH1106可视区从GDRAM列2开始)
+        OLED_WR_Cmd(0x10);       // 列地址高4位
 				for (n=0; n< 128; n++)
 					OLED_WR_Byte(OLED_GRAM[n][i]);
     }

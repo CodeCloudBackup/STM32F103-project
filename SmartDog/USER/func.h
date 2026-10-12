@@ -7,6 +7,7 @@
 #include "led.h"
 #include "oled.h"
 #include "servo.h"
+#include "ws2812.h"
 #include "malloc.h"
 #include "ble_uart.h"
 #include "ble_protocol.h"
@@ -46,6 +47,7 @@ void handle_expr_return(void);   /* 转弯停止1s后恢复原表情的轮询(�
 void handle_status_req(void);
 void handle_sleep(void);						/* 待机:停止动作并进入睡眠表情 */
 void handle_timeout_guard(u32 *last_valid_tick); /* 通信超时保护:5s停动作/10min待机 */
+void handle_light(u32 comm_elapsed_ms);     /* 灯效联动:按动作/表情/通信状态自动切换(主循环每轮调用) */
 
 //////////////////////////
 void Memory_Test(void);

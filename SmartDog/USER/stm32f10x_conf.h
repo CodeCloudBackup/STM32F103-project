@@ -32,7 +32,7 @@
 //#include "stm32f10x_crc.h"
 #include "stm32f10x_dac.h"
 #include "stm32f10x_dbgmcu.h"
-//#include "stm32f10x_dma.h"
+#include "stm32f10x_dma.h"     /* WS2812 驱动用 TIM1_UP 触发 DMA1_Channel2 写 GPIOA->BSRR */
 #include "stm32f10x_exti.h"
 //#include "stm32f10x_flash.h"
 //#include "stm32f10x_fsmc.h"

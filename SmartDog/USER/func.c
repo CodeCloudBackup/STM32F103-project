@@ -4,12 +4,13 @@
  
 void handle_leg_reset(void)
 {
-	Servo_Head(90);   // PB0 头 占空比2.5%，0度
-	Servo_Tail(90);   // PB1 尾 占空比2.5%，0度
-	Servo_Leg_FL(90);  // PB6 左前腿
-  Servo_Leg_FR(90);  // PB7 右前腿
-  Servo_Leg_BL(90);  // PB8 左后腿
-  Servo_Leg_BR(90);  // PB9 右后腿
+	Servo_Head(90);   // PB1 头 占空比2.5%，0度
+	Servo_Tail(90);   // PB7 尾巴 占空比2.5%，0度
+	/* 四腿写逻辑角90(站立), 底层自动叠加安装补偿: 左腿->87, 右前->82, 右后->98 */
+	Servo_Leg_FL(90);  // PB8 左前脚
+  Servo_Leg_FR(90);  // PB6 右前脚
+  Servo_Leg_BL(90);  // PB9 左后脚
+  Servo_Leg_BR(90);  // PB0 右后脚
 	delay_ms(1000);
 	printf("leg_reset handle\r\n");
 }
@@ -144,14 +145,14 @@ void handle_joystick(u8 dataX, u8 datay)
 		return;
 	}
 
-	if (adx > ady)              /* 水平为主: 前后(按要求与垂直轴对调) */
+	if (adx > ady)              /* 水平为主: 左转/右转(带表情联动偏移) */
 	{
+		if (dx > 0) {Joy_Right(); turn_expr_enter(10); } /* 右滑→右转:脸右偏10px */
+		else        {Joy_Left();  turn_expr_enter(-10); }  /* 左滑→左转:脸左偏10px */
+	} else {                    /* 垂直为主: 前进/后退 */
 		turn_expr_exit();             /* 非转弯指令:退出联动(若激活则回正计时) */
-		if (dx > 0) {Joy_Right();turn_expr_enter(10); } /* 右滑*/
-		else        {Joy_Left(); turn_expr_enter(-10); }   /* 左滑 */
-	} else {                    /* 垂直为主: 转向 */
-		if (dy > 0) { Joy_Up();     }  /* 上推右转:脸右偏10px */
-		else        { Joy_Down(); }  /* 下拉左转:脸左偏10px */
+		if (dy > 0) { Joy_Up();   }  /* 上推→前进 */
+		else        { Joy_Down(); }  /* 下拉→后退 */
 	}
 }
 
@@ -208,28 +209,63 @@ u8     g_action_param = 0;
 /* ==================== 动作脚本库 ====================
  * 约定: 90=中位/站立, 120=前/抬起, 60=后/压下, 0=本步该轴不动
  * STEP(头,尾,左前,右前,左后,右后,保持ms)
+ * 四腿角度为逻辑角: 底层 Servo_Leg_xx() 会自动叠加各腿安装补偿
+ * (左±3/右±8, 见 servo.h LEG_xxx_OFFSET), 故所有姿态/步态角度均已含补偿
  * 因实际舵机安装方向可能相反,若某动作方向反了,把对应的120/60对调即可
  */
 #define STEP(h, t, fl, fr, bl, br, ms)  { h, t, fl, fr, bl, br, (StepMs)(ms) }
 #define SCRIPT_LEN(a)  ((u8)(sizeof(a) / sizeof((a)[0])))
 
-/* ---- 运动(循环步态) ---- 数组名对应摇杆手势: fwd=上推 back=下拉 left=左滑 right=右滑
- * (名字跟手势,具体物理动作见各行注释,数据与手势互换前一致) */
-static const ServoStep scr_walk_fwd[] = {   /* 上推手势触发: 物理右转步态 */
-    STEP(90,90,  60,120,  60,120,  300),
-    STEP(90,90,  90, 90,  90, 90,  150),
+/* ---- 运动(循环步态) ----
+ * ==================== 四足运动原理 ====================
+ * 每条腿只有 1 个自由度（髋部前/后摆）, 无膝关节抬升。
+ * 前进/后退靠“向后的腿扒地推身体”产生推力, 循环交替相位实现连续运动。
+ * 角度约定(原始逻辑角, 底层自动叠加各腿安装补偿):
+ *   120=数值大于90的方向, 60=数值小于90的方向
+ *   实际物理方向由下方 L_FWD/L_BACK/R_FWD/R_BACK 按左右镜像关系给出
+ *   STEP 字段顺序: (头, 尾, 左前FL, 右前FR, 左后BL, 右后BR, 保持ms)
+ *
+ * 【关键: 左右舵机安装方向镜像相反】
+ *   实测同一原始角度值, 左腿向前摆时右腿向后摆(安装方向相反),
+ *   故脚本里必须按腿区分写值: 左腿"前摆"=120, 右腿"前摆"=60(取反)。
+ *   站立中位90不受影响(镜像中心即90), 各腿补偿仍由底层叠加。
+ *
+ * 【前进/后退 = 对角步态(trot)】
+ *   将“左前+右后”(一对对角)与“右前+左后”(另一对对角)分组,
+ *   两组始终反向摆动: 一组扒地时另一组前摆复位。对角支撑形成稳定三角,
+ *   身体不侧翻。后退只需把两组的扒地/前摆方向整体取反。
+ *
+ * 【左转/右转 = 同侧差速(scrub turn)】
+ *   改为按“左侧两腿 / 右侧两腿”分组, 两侧物理反向摆动:
+ *   一侧前推、另一侧后扒, 两侧力矩方向相反 -> 机身原地旋转。
+ *   右转: 左腿前推 + 右腿后扒; 左转: 右腿前推 + 左腿后扒。
+ *   (跟前进的区别就在于分组方式: 对角=直走, 同侧=转向)
+ */
+#define LEG_FWD   120   /* 逻辑角: 数值大于90 */
+#define LEG_BACK   60   /* 逻辑角: 数值小于90 */
+#define LEG_MID    90   /* 中位/站立 */
+
+/* 按安装镜像关系区分左右腿的"物理方向"写值 */
+#define L_FWD    LEG_FWD    /* 左腿(FL/BL): 向前摆 -> 120 */
+#define L_BACK   LEG_BACK   /* 左腿(FL/BL): 向后摆 -> 60  */
+#define R_FWD    LEG_BACK   /* 右腿(FR/BR): 向前摆 -> 60  (安装反向,数值取反) */
+#define R_BACK   LEG_FWD    /* 右腿(FR/BR): 向后摆 -> 120 (安装反向,数值取反) */
+
+static const ServoStep scr_walk_forward[] = {   /* 前进: 对角步态 */
+    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 260),  /* 相1: 对角FL+BR物理后扒推动, FR+BL物理前摆复位 */
+    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  260),  /* 相2: 两组对角互换, 循环推进 */
 };
-static const ServoStep scr_walk_back[] = {  /* 下拉手势触发: 物理左转步态 */
-    STEP(90,90, 120, 60, 120, 60,  300),
-    STEP(90,90,  90, 90,  90, 90,  150),
+static const ServoStep scr_walk_backward[] = {  /* 后退: 对角步态方向取反 */
+    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  260),  /* 相1: 对角FL+BR物理前摆, FR+BL物理后扒 -> 往后推 */
+    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 260),  /* 相2: 两组对角互换 */
 };
-static const ServoStep scr_turn_right[] = { /* 右滑手势触发: 物理前进对角步态 */
-    STEP(90,90,  60,120, 120, 60,  300),
-    STEP(90,90, 120, 60,  60,120,  300),
+static const ServoStep scr_turn_right[] = {     /* 右转: 同侧差速原地转 */
+    STEP(90,90, L_FWD,  R_BACK, L_FWD,  R_BACK, 300),  /* 相1: 左腿物理前推 + 右腿物理后扒 -> 机身右转 */
+    STEP(90,90, L_BACK, R_FWD,  L_BACK, R_FWD,  300),  /* 相2: 两侧回摆复位, 持续旋转力矩 */
 };
-static const ServoStep scr_turn_left[] = {  /* 左滑手势触发: 物理后退步态 */
-    STEP(90,90, 120, 60,  60,120, 300),
-    STEP(90,90,  60,120, 120, 60,  300),
+static const ServoStep scr_turn_left[] = {      /* 左转: 同侧差速原地转 */
+    STEP(90,90, L_BACK, R_FWD,  L_BACK, R_FWD,  300),  /* 相1: 右腿物理前推 + 左腿物理后扒 -> 机身左转 */
+    STEP(90,90, L_FWD,  R_BACK, L_FWD,  R_BACK, 300),  /* 相2: 两侧回摆复位 */
 };
 
 /* ---- 姿势(单次执行) ---- */
@@ -287,24 +323,39 @@ static u8   s_script_len = 0;
 static u8   s_script_idx = 0;
 static u8   s_script_loop = 0;
 static uint32_t s_step_tick = 0;
+static uint32_t s_script_deadline = 0;  /* 循环步态的停止时刻(0=不限时:摇杆持续指令/单次姿势) */
+
+#define PRESET_MOVE_MS  20000u          /* 预定运动动作时长 20s */
 
 /* 播放一段脚本;loop=1循环(步态),loop=0执行一遍后回空闲
  * 若已在播放同一循环脚本(摇杆持续同方向),不重置相位 */
 static void Servo_PlayScript(const ServoStep *steps, u8 len, u8 loop)
 {
     if (loop && g_action_state == ACTION_SCRIPT && s_script == steps && s_script_loop)
+    {
+        s_script_deadline = 0;          /* 新指令接管:取消预定动作定时,改为持续执行 */
         return;
+    }
     s_script      = steps;
     s_script_len  = len;
     s_script_idx  = 0;
     s_script_loop = loop;
+    s_script_deadline = 0;
     Servo_RunStep(&s_script[0]);
     s_step_tick = g_sys_tick_ms;
     g_action_state = ACTION_SCRIPT;
     g_action_start_tick = g_sys_tick_ms;
 }
 
-/* CMD_ACTION(0x30) 动作码 → 姿势脚本分发 */
+/* 定时播放循环步态(预定动作): duration_ms 到点后自动切回站立脚本
+ * 与摇杆步态共用同一套脚本/同一状态机,只在停止时刻上区分 */
+static void Servo_PlayScriptTimed(const ServoStep *steps, u8 len, uint32_t duration_ms)
+{
+    Servo_PlayScript(steps, len, 1);
+    s_script_deadline = g_sys_tick_ms + duration_ms;  /* 回绕安全:判定时用差值 */
+}
+
+/* CMD_ACTION(0x30) 动作码 → 姿势/步态脚本分发 */
 void handle_action_cmd(u8 act_val)
 {
     switch (act_val)
@@ -317,17 +368,26 @@ void handle_action_cmd(u8 act_val)
     case ACT_WAG_TAIL:    Servo_PlayScript(scr_wag_tail,    SCRIPT_LEN(scr_wag_tail),    0); break;
     case ACT_MARK:        Servo_PlayScript(scr_mark,        SCRIPT_LEN(scr_mark),        0); break;
     case ACT_WAVE:        Servo_PlayScript(scr_handshake,   SCRIPT_LEN(scr_handshake),   0); break;
+    /* ---- 预定运动动作: 循环步态跑完20s后自动收腿站立 ---- */
+    case ACT_MOVE_FORWARD: Servo_PlayScriptTimed(scr_walk_forward,  SCRIPT_LEN(scr_walk_forward),  PRESET_MOVE_MS);
+                        break;
+    case ACT_MOVE_BACK:    Servo_PlayScriptTimed(scr_walk_backward, SCRIPT_LEN(scr_walk_backward), PRESET_MOVE_MS);
+                        break;
+    case ACT_TURN_LEFT:    Servo_PlayScriptTimed(scr_turn_left,     SCRIPT_LEN(scr_turn_left),     PRESET_MOVE_MS);
+                        break;
+    case ACT_TURN_RIGHT:   Servo_PlayScriptTimed(scr_turn_right,    SCRIPT_LEN(scr_turn_right),    PRESET_MOVE_MS);
+                        break;
     default:
         printf("No program for action 0x%02X\r\n", act_val);
         break;
     }
 }
 
-/* ---- 摇杆手势→步态接口(名字=触发手势,数组名同为手势方向,注释=物理动作) ---- */
-void Joy_Right(void) { Servo_PlayScript(scr_turn_right, SCRIPT_LEN(scr_turn_right), 1); }  /* 右滑→前进 */
-void Joy_Left(void)  { Servo_PlayScript(scr_turn_left,  SCRIPT_LEN(scr_turn_left),  1); }  /* 左滑→后退 */
-void Joy_Up(void)    { Servo_PlayScript(scr_walk_fwd,   SCRIPT_LEN(scr_walk_fwd),   1); }  /* 上推→右转 */
-void Joy_Down(void)  { Servo_PlayScript(scr_walk_back,  SCRIPT_LEN(scr_walk_back),  1); }  /* 下拉→左转 */
+/* ---- 摇杆手势→步态接口(手势方向 = 物理运动方向) ---- */
+void Joy_Up(void)    { Servo_PlayScript(scr_walk_forward,  SCRIPT_LEN(scr_walk_forward),  1); }  /* 上推→前进 */
+void Joy_Down(void)  { Servo_PlayScript(scr_walk_backward, SCRIPT_LEN(scr_walk_backward), 1); }  /* 下拉→后退 */
+void Joy_Left(void)  { Servo_PlayScript(scr_turn_left,     SCRIPT_LEN(scr_turn_left),     1); }  /* 左滑→左转 */
+void Joy_Right(void) { Servo_PlayScript(scr_turn_right,    SCRIPT_LEN(scr_turn_right),    1); }  /* 右滑→右转 */
 
 /* ==================== 非阻塞动作执行器 ==================== */
 /*
@@ -342,6 +402,14 @@ u8 handle_action(void)
         return 0;
 
     case ACTION_SCRIPT:
+        /* 预定动作定时到: 停止循环步态,收腿站立(单次执行姿势脚本不带deadline,不受此处影响) */
+        if (s_script_deadline && (int32_t)(g_sys_tick_ms - s_script_deadline) >= 0)
+        {
+            s_script_deadline = 0;
+            Servo_PlayScript(scr_stand, SCRIPT_LEN(scr_stand), 0);
+            printf("preset action done, stand up\r\n");
+            return 1;
+        }
         /* 当前步保持时间到,推进到下一步 */
         if (g_sys_tick_ms - s_step_tick >= s_script[s_script_idx].t)
         {
@@ -371,6 +439,91 @@ u8 handle_action(void)
     }
 }
 
+/* ==================== 灯效联动(不动蓝牙协议,本地推断) ====================
+ * 不加新定时器/中断: 每轮主循环算一次"目标灯效", 只在发生变化时才调
+ * WS2812_SetMode(内部阻塞发完首帧,8灯约240us), 之后的流水/呼吸/闪烁仍由
+ * 主循环 WS2812_Tick() 非阻塞推进, 不影响步态相位与心跳应答
+ *
+ * 判定优先级: 睡觉表情 > 通信报警 > 步态运动 > 其余表情 > 其余时间
+ *   睡觉排在报警前面: 10min无通信会自动进睡眠表情,若不排前面就会红闪一整夜
+ *   "运动"只指四足步态(摇杆前进/后退/左转/右转 及 20s 预定运动动作);
+ *   坐下/趴下/摇头/摇尾/标记/握手 这类单次姿势不算,走表情色
+ * 颜色为"基准色", 实际输出还要再乘全局亮度 s_brightness(默认128,约一半),
+ *   所以"暗绿/暗蓝"直接用小数值的基准色即可
+ */
+enum {
+	LT_MOVE = 0,     /* 步态运动: 蓝色闪烁 */
+	LT_ALARM,        /* 通信中断报警: 红色闪烁 */
+	LT_SLEEP,        /* 表情-睡觉: 暗绿呼吸 */
+	LT_ANGRY,        /* 表情-生气: 橙色快速流水 */
+	LT_CRY,          /* 表情-哭泣: 暗蓝常亮 */
+	LT_HAPPY,        /* 表情-开心: 七彩闪烁 */
+	LT_IDLE          /* 其余时间: 蓝色常亮 */
+};
+
+static u8 s_light_last      = 0xFF;  /* 0xFF=上电后还没设过灯效(保证首次必上灯) */
+static u8 s_light_seen_comm = 0;     /* 本次上电后是否建立过通信(避免开机就报警) */
+
+static void light_apply(u8 st)
+{
+	switch (st)
+	{
+	case LT_MOVE:                                /* 运动: 蓝色闪烁(亮125ms+灭125ms) */
+		WS2812_SetAllMode(WS2812_MODE_FLASH,   0,   0, 255, 250);
+		break;
+	case LT_ALARM:                               /* 通信中断: 红色闪烁 */
+		WS2812_SetAllMode(WS2812_MODE_FLASH, 255,   0,   0, WS2812_PERIOD_FLASH);
+		break;
+	case LT_SLEEP:                               /* 睡觉: 暗绿呼吸 */
+		WS2812_SetAllMode(WS2812_MODE_BREATH,  0,  90,   0, WS2812_PERIOD_BREATH);
+		break;
+	case LT_ANGRY:                               /* 生气: 橙色快速流水(8灯一圈约0.48s) */
+		WS2812_SetAllMode(WS2812_MODE_FLOW,  255, 120,   0, 60);
+		break;
+	case LT_CRY:                                 /* 哭泣: 暗蓝常亮 */
+		WS2812_SetAllMode(WS2812_MODE_ON,      0,   0,  90, 0);
+		break;
+	case LT_HAPPY:                               /* 开心: 七彩闪烁(七色走一圈约2.1s) */
+		WS2812_SetAllMode(WS2812_MODE_RAINBOW, 255,   0,   0, WS2812_PERIOD_RAINBOW);
+		break;
+	case LT_IDLE:                                /* 其余: 蓝色常亮 */
+	default:
+		WS2812_SetAllMode(WS2812_MODE_ON,      0,   0, 255, 0);
+		break;
+	}
+}
+
+/* comm_elapsed_ms: 距最近一次收到有效帧(心跳/正确指令)的时长,由主循环传入 */
+void handle_light(u32 comm_elapsed_ms)
+{
+	u8 want;
+
+	if (comm_elapsed_ms < 5000) s_light_seen_comm = 1;   /* 通信建立过,之后才允许报警 */
+
+	if (g_current_expr_id == EXP_SLEEP)
+		want = LT_SLEEP;                                /* 睡觉: 暗绿呼吸,不被报警覆盖 */
+	else if (s_light_seen_comm && comm_elapsed_ms >= 5000)
+		want = LT_ALARM;                                /* 5s 无有效帧: 红色闪烁报警 */
+	else if (g_action_state == ACTION_SCRIPT &&
+	    (s_script == scr_walk_forward || s_script == scr_walk_backward ||
+	     s_script == scr_turn_left    || s_script == scr_turn_right))
+		want = LT_MOVE;                                 /* 只有四足步态算"运动" */
+	else switch (g_current_expr_id)                     /* 其余看表情 */
+	{
+		case EXP_ANGRY: want = LT_ANGRY; break;
+		case EXP_CRY:   want = LT_CRY;   break;
+		case EXP_HAPPY: want = LT_HAPPY; break;
+		default:        want = LT_IDLE;  break;         /* NORMAL/发呆/未知 */
+	}
+
+	if (want == s_light_last) return;                   /* 灯效未变: 不发消息不占时间 */
+	printf("LIGHT %u->%u comm=%u act=%u expr=%u\r\n",
+	       (unsigned)s_light_last, (unsigned)want, (unsigned)comm_elapsed_ms,
+	       (unsigned)g_action_state, (unsigned)g_current_expr_id);
+	s_light_last = want;
+	light_apply(want);
+}
+
 /* 表情轮播测试: 依次展示6个表情,每个3秒 */
 void Expression_Test(void)
 {
@@ -388,20 +541,20 @@ void Expression_Test(void)
  // 硬件功能验证函数
  void Servo_Test(void)
  {
-	Servo_Head(0);   // PB0 头 占空比2.5%，0度
-	Servo_Tail(0);   // PB1 尾 占空比2.5%，0度
-	Servo_Leg_FL(0);  // PB6 左前腿
-    Servo_Leg_FR(0);  // PB7 右前腿
-    Servo_Leg_BL(0);  // PB8 左后腿
-    Servo_Leg_BR(0);  // PB9 右后腿
+	//Servo_Head(0);   // PB1 头 占空比2.5%，0度
+	//Servo_Tail(0);   // PB7 尾巴 占空比2.5%，0度
+	Servo_Leg_FL(0);  // PB8 左前脚
+    //Servo_Leg_FR(0);  // PB6 右前脚
+  //Servo_Leg_BL(0);  // PB9 左后脚
+   // Servo_Leg_BR(0);  // PB0 右后脚
 	delay_ms(1000);
 	  LED0 = !LED0;
-	Servo_Head(60); // PB0 头 占空比7.5%，90度
-	Servo_Tail(60); // PB1 尾 占空比7.5%，90度
-	Servo_Leg_FL(60);  // PB6 左前腿
-    Servo_Leg_FR(60);  // PB7 右前腿
-    Servo_Leg_BL(60);  // PB8 左后腿
-    Servo_Leg_BR(60);  // PB9 右后腿
+	//Servo_Head(60); // PB1 头 占空比7.5%，90度
+	//Servo_Tail(60); // PB7 尾巴 占空比7.5%，90度
+	Servo_Leg_FL(60);  // PB8 左前脚
+   // Servo_Leg_FR(60);  // PB6 右前脚
+   //Servo_Leg_BL(60);  // PB9 左后脚
+   // Servo_Leg_BR(60);  // PB0 右后脚
 	delay_ms(1000); 
 	 LED0 = !LED0;
  }

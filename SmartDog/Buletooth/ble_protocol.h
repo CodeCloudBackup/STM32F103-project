@@ -44,6 +44,11 @@ typedef enum {
     ACT_PUSH_UP     = 0x0A,
     ACT_SWAY        = 0x0B,
     ACT_ROCK        = 0x0C,
+    /* 预定运动动作(追加): 循环步态跑满 20s 后自动收腿站立 */
+    ACT_MOVE_FORWARD = 0x0D,   /* 前进20s */
+    ACT_MOVE_BACK    = 0x0E,   /* 后退20s */
+    ACT_TURN_LEFT    = 0x0F,   /* 左转20s */
+    ACT_TURN_RIGHT   = 0x10,   /* 右转20s */
 } ActionValue;
 
 typedef enum {

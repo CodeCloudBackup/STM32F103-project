@@ -17,6 +17,8 @@
 	 printf("usart driver init success\r\n");
 	SG90_Servo_Init();  // SERVO 初始化
 	 printf("servo driver init success\r\n");
+	WS2812_Init();      // WS2812 灯效初始化(PA6/PA7 两路,默认常灭)
+	 printf("WS2812 driver init success\r\n");
 	OLED_Init();				// OLED 初始化
 	 printf("OLED driver init success\r\n");
 	MY_Memory_Init(SRAMIN);		// 初始化内存池
@@ -31,10 +33,9 @@
 
 	//Expression_Test();
 	/* 开机默认显示"发呆"表情，之后由蓝牙CMD_EXPRESSION(0x31)切换 */
-	g_target_expr_id  = EXP_SLEEP;
+	g_target_expr_id  = EXP_NORMAL;
 	handle_expression();
 	g_current_expr_id = g_target_expr_id;
-	
 	
 	// 初始化舵机角
 	handle_leg_reset();
@@ -44,7 +45,8 @@
 	u32 last_expr_refresh_tick = 0;
 	u32 last_valid_tick = 0;   /* 最近一次收到心跳/有效指令的时刻 */
 	ParsedFrame frame;
-	
+	//WS2812_BasicTest();     /* 位敲/正式驱动自检均已通过,灯效改由 handle_light 联动接管理 */
+	last_valid_tick = g_sys_tick_ms;  /* 开机时刻当作通信起点,避免上电就误判超时 */
 	while(1)
 	{
 		
@@ -136,6 +138,10 @@
 		}
 		// ===== 任务3：动作状态机调度 ===== 
 		handle_action();
+		// ===== 任务3.4：灯效联动(按动作/表情/通信状态切换,只在变化时发一帧) ===== 
+		handle_light(g_sys_tick_ms - last_valid_tick);
+		// ===== 任务3.5：WS2812灯效动画推进(流水/闪烁/呼吸,非阻塞) ===== 
+		WS2812_Tick();
 		// ===== 任务4：表情刷新调度 ===== 
 		if (g_expr_dirty) {
 			if (g_sys_tick_ms - last_expr_refresh_tick >= 50)

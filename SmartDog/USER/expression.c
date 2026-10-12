@@ -10,7 +10,7 @@
 static void expr_dot_p(int x, int y, u8 p)       /* 带越界保护的画点(p=1点亮,0熄灭) */
 {
 	if(x >= 0 && x < 128 && y >= 0 && y < 64)
-		OLED_DrawPoint((u8)(127 - x), (u8)(63 - y), p); /* DisplayTurn(1)后GRAM x=0在右、y=0在下,统一翻转正逻辑坐标系 */
+		OLED_DrawPoint((u8)(127 - x), (u8)(y), p); /* DisplayTurn(1)后GRAM x=0在右,翻转X;Y轴上下翻转:逻辑y直接映射GRAM y */
 }
 static void expr_dot(int x, int y) { expr_dot_p(x, y, 1); }
 
@@ -113,15 +113,15 @@ static void expr_Z(int x, int y, int s, int t)
 	expr_line_thick(x, y + s, x + s, y + s, t);      /* 下横 */
 }
 
-/* 凸上凹下弧形条(眼笑成拱): 宽=2w, 每列上/下边界都是半径w的半圆弧,
- * 上边外凸、下边内凹,形成等厚弯条; t=弯条竖直半厚, (cx,cy)=边缘列中心 */
-static void expr_smile_band(int cx, int cy, int w, int t)
+/* 凸上凹下弧形条(眼笑成拱): 宽=2w, 每列上/下边界都是椭圆弧(半宽w,半高h);
+ * t=弯条竖直半厚, (cx,cy)=边缘列中心 */
+static void expr_smile_band(int cx, int cy, int w, int h, int t)
 {
 	int dx, dy, s;
 	for(dx = -w; dx <= w; dx++){
-		for(s = w; s*s > w*w - dx*dx; s--);      /* s = sqrt(w²-dx²) 整数化 */
+		for(s = h; w*w*s*s > h*h*(w*w - dx*dx); s--);  /* 椭圆: (dx/w)²+(s/h)²=1 */
 		for(dy = -t; dy <= t; dy++)
-			expr_dot(cx + dx, cy - s + dy);      /* 整列随半圆弧上移 */
+			expr_dot(cx + dx, cy - s + dy);
 	}
 }
 
@@ -131,14 +131,14 @@ static void expr_smile_band(int cx, int cy, int w, int t)
  */
 void expr_face_normal(void)        /* 正常: 两个实心圆角正方形眼睛(可随转弯水平偏移) */
 {
-	expr_round_square_fill(35 + g_expr_shift, 34, 20, 6);  /* 左眼 */
-	expr_round_square_fill(93 + g_expr_shift, 34, 20, 6);  /* 右眼 */
+	expr_round_square_fill(32 + g_expr_shift, 34, 20, 4);  /* 左眼 */
+	expr_round_square_fill(90 + g_expr_shift, 34, 20, 4);  /* 右眼 */
 }
 
-void expr_face_happy(void)         /* 开心: 两个凸/凹半圆拱形笑眼(宽20) */
+void expr_face_happy(void)         /* 开心: 矮弧笑眼(宽保持20,弧高缩小) */
 {
-	expr_smile_band(35, 34, 20, 4);               /* 左眼: 上边外凸、下边上凹 */
-	expr_smile_band(93, 34, 20, 4);               /* 右眼 */
+	expr_smile_band(32, 34, 20, 14, 4);             /* 左眼: w=20 h=12 t=4 */
+	expr_smile_band(90, 34, 20, 14, 4);             /* 右眼 */
 }
 
 void expr_face_cry(void)           /* 哭泣: 15高X20宽圆角矩形眼 + 囧形拱眉 + 左眼下一滴小泪 */
@@ -150,7 +150,7 @@ void expr_face_cry(void)           /* 哭泣: 15高X20宽圆角矩形眼 + 囧�
 	expr_clear_above(73, 113, 78, 12, 108, 20);   /* 右眼全宽对称剪裁 */
 	expr_line(20, 20, 50, 12);                    /* 左眉: 外低内高,向眉心抬起 */
 	expr_line(78, 12, 108, 20);                   /* 右眉: 内高外低,镜像 */
-	expr_line_thick(100, 46, 100, 48, 1); expr_fill_circle(100, 54, 4); /* 左眼下一滴小泪珠 */
+	expr_line_thick(30, 46, 30, 48, 1); expr_fill_circle(30, 54, 4); /* 左眼下一滴小泪珠 */
 }
 
 void expr_face_daze(void)          /* 发呆: 大瞪眼(空心圈+小瞳) */
@@ -161,14 +161,14 @@ void expr_face_daze(void)          /* 发呆: 大瞪眼(空心圈+小瞳) */
 
 void expr_face_angry(void)         /* 生气: 圆角方块眼(与正常同款) + 倒八字勾型压眉 */
 {
-	expr_round_rect_fill(35, 29, 20, 15, 6);        /* 左眼 */
-	expr_round_rect_fill(93, 29, 20, 15, 6);        /* 右眼 */
-	expr_clear_above(15, 55, 18, 10, 46, 22);     /* 左眼高出眉线的部分熄灭 */
-	expr_clear_above(73, 113, 110, 10, 82, 22);   /* 右眼对称剪裁 */
-	expr_line_thick(18, 10, 46, 22, 2);           /* 左眉: 外高内低,眉尾压上眼沿 */
-	expr_line_thick(46, 22, 46, 30, 1);           /* 左眉内端下勾 */
-	expr_line_thick(110, 10, 82, 22, 2);          /* 右眉镜像 */
-	expr_line_thick(82, 22, 82, 30, 1);           /* 右眉内端下勾 */
+	expr_round_rect_fill(30, 30, 20, 15, 6);        /* 左眼 */
+	expr_round_rect_fill(88, 30, 20, 15, 6);        /* 右眼 */
+	expr_clear_above(10, 50, 13, 16, 41, 28);     /* 左眼高出眉线的部分熄灭(眉毛y下移5) */
+	expr_clear_above(68, 108, 105, 16, 77, 28);   /* 右眼对称剪裁 */
+	expr_line_thick(13, 16, 41, 28, 2);           /* 左眉: 外高内低,眉尾压上眼沿 */
+	expr_line_thick(41, 28, 41, 36, 1);           /* 左眉内端下勾 */
+	expr_line_thick(105, 16, 77, 28, 2);          /* 右眉镜像 */
+	expr_line_thick(77, 28, 77, 36, 1);           /* 右眉内端下勾 */
 }
 
 void expr_face_sleep(void)         /* 睡觉: 两条粗闭眼横线 + 右上角递减三个Z字 */
