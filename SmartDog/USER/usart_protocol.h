@@ -1,20 +1,18 @@
-#ifndef __BLE_PROTOCOL_H
-#define __BLE_PROTOCOL_H
+#ifndef __USART_PROTOCOL_H
+#define __USART_PROTOCOL_H
 
 #include "stm32f10x.h"
 #include <string.h>
-#include "ble_uart.h"
-#include "bluetooth_jdy32.h"
 
 /* ==================== 协议常量 ==================== */
-#define BLE_HEAD1       0xAA
-#define BLE_HEAD2       0x55
-#define BLE_TAIL1       0x0D
-#define BLE_TAIL2       0x0A
-#define BLE_MAX_DATA    64          /* 最大数据域长度 */
-#define BLE_FRAME_MAX   (2+1+1+BLE_MAX_DATA+1+2)  /* 最大帧长 */
+#define USART_HEAD1     0xAA
+#define USART_HEAD2     0x55
+#define USART_TAIL1     0x0D
+#define USART_TAIL2     0x0A
+#define USART_MAX_DATA  64          /* 最大数据域长度 */
+#define USART_FRAME_MAX (2+1+1+USART_MAX_DATA+1+2)  /* 最大帧长 */
 
-/* ========== 命令码（与小程序端一致）========== */
+/* ==================== 命令码（与上位机端一致）==================== */
 typedef enum {
     CMD_HEARTBEAT     = 0x01,		// 心跳
     CMD_STATUS_REQ    = 0x02,		// 状态请求
@@ -24,13 +22,13 @@ typedef enum {
     CMD_JOYSTICK      = 0x20,		// 摇杆坐标
     CMD_HEADING       = 0x21,		// 滑杆角度
     CMD_ACTION        = 0x30,		// 统一动作指令（12个按键合并）
-		CMD_EXPRESSION    = 0x31,   /* 表情切换指令 */
+    CMD_EXPRESSION    = 0x31,   /* 表情切换指令 */
+    CMD_LOTTERY       = 0x06,   /* 抽奖指令(新增专用命令码, 避开 0x31/0x05 与正常表情的冲突) */
     CMD_BATTERY       = 0x40,   /* 接收：电量上报 */
     CMD_STATUS_REPORT = 0x41,   /* 接收：状态上报 */
 } CmdCode;
 
-/* ========== 动作指令值 ========== */
-/* ==================== 动作值 ==================== */
+/* ==================== 动作指令值 ==================== */
 typedef enum {
     ACT_STAND       = 0x01,
     ACT_LIE_BACK    = 0x02,
@@ -51,6 +49,7 @@ typedef enum {
     ACT_TURN_RIGHT   = 0x10,   /* 右转20s */
 } ActionValue;
 
+/* ==================== 表情类型 ==================== */
 typedef enum {
     EXP_HAPPY   = 0x00,
     EXP_CRY     = 0x01,
@@ -63,20 +62,12 @@ typedef enum {
 /* ==================== 解析结果结构体 ==================== */
 typedef struct {
     uint8_t  cmd;
-    uint8_t  data[BLE_MAX_DATA];
+    uint8_t  data[USART_MAX_DATA];
     uint8_t  data_len;
     uint8_t  valid;   /* 1=有效帧, 0=无效 */
 } ParsedFrame;
 
-
-/* ==================== 环形缓冲区 ==================== */
-#define BLE_RX_BUF_SIZE 256
-typedef struct {
-    uint8_t  buf[BLE_RX_BUF_SIZE];
-    volatile uint16_t head;   /* 写指针（中断中写） */
-    volatile uint16_t tail;   /* 读指针（主循环中读） */
-} BleRingBuf;
-
+/* ==================== 解析状态机状态 ==================== */
 typedef enum {
     STATE_WAIT_HEAD1,
     STATE_WAIT_HEAD2,
@@ -87,20 +78,20 @@ typedef enum {
     STATE_WAIT_TAIL1,
     STATE_WAIT_TAIL2,
 } ParseState;
+
 /* ==================== 全局变量 ==================== */
-extern BleRingBuf g_ble_ring;
 extern volatile uint32_t g_sys_tick_ms;  /* 由 TIM2 中断递增 */
-extern volatile uint16_t g_isr_rx_cnt;   /* ISR 收到的总字节数（调试用） */
-extern volatile uint16_t g_pop_cnt;      /* 状态机消费的总字节数（调试用） */
-extern volatile ParseState g_parse_state_dbg;
+
 /* ==================== 函数声明 ==================== */
-void BLE_Protocol_Init(uint32_t baud);
-u8  BLE_PollFrame(ParsedFrame *frame);  /* 主循环中轮询解析 */
-void BLE_SendByte(uint8_t byte);
-void BLE_SendArray(const uint8_t *data, uint16_t len);
-void BLE_SendFrame(CmdCode cmd, const uint8_t *data, uint8_t data_len);
-
-
+/* 初始化 USART3(PB10/PB11, baud) 接收通道; USART1(PA9/PA10) 由 uart_init 建立 */
+void USART_Protocol_Init(uint32_t baud);
+/* 轮询 USART1 与 USART3 两路接收缓冲, 解析到一帧返回 1, 否则返回 0 */
+u8   USART_PollFrame(ParsedFrame *frame);
+/* 以下发送固定走 USART1(PA9) */
+void USART_SendByte(uint8_t byte);
+void USART_SendArray(const uint8_t *data, uint16_t len);
+void USART_SendFrame(CmdCode cmd, const uint8_t *data, uint8_t data_len);
+/* 同格式帧发送到 USART3(PB10=TX): 供摇尾等指令转发给下游设备 */
+void USART3_SendFrame(CmdCode cmd, const uint8_t *data, uint8_t data_len);
 
 #endif
-

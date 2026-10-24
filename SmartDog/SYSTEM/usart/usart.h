@@ -20,6 +20,10 @@ extern u16 USART_RX_STA;         		//接收状态标记
 
 //如果想串口中断接收，请不要注释以下宏定义
 void uart_init(u32 bound);
+void USART3_Init(u32 bound);	//USART3 初始化(PB10=TX, PB11=RX)
+/* 分串口格式化打印, 便于区分输出口 */
+void usart1_printf(const char *fmt, ...);	//输出到 USART1(PA9)
+void usart3_printf(const char *fmt, ...);	//输出到 USART3(PB10)
 //void USART2_Init(u32 bound);
 //void USART2_SendByte(u8 data);
 //void USART2_SendString(char *str);

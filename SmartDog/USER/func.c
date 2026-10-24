@@ -4,13 +4,9 @@
  
 void handle_leg_reset(void)
 {
-	Servo_Head(90);   // PB1 头 占空比2.5%，0度
-	Servo_Tail(90);   // PB7 尾巴 占空比2.5%，0度
-	/* 四腿写逻辑角90(站立), 底层自动叠加安装补偿: 左腿->87, 右前->82, 右后->98 */
-	Servo_Leg_FL(90);  // PB8 左前脚
-  Servo_Leg_FR(90);  // PB6 右前脚
-  Servo_Leg_BL(90);  // PB9 左后脚
-  Servo_Leg_BR(90);  // PB0 右后脚
+	/* 六轴目标/当前角同步为站立逻辑角90, 底层自动叠加安装补偿:
+	 * 左腿->87, 右前->82, 右后->98; 之后由 Servo_RampTick 统一驱动 */
+	Servo_RampInit();
 	delay_ms(1000);
 	printf("leg_reset handle\r\n");
 }
@@ -26,7 +22,7 @@ signed char g_expr_shift = 0;   /* 正常表情水平偏移px(转弯联动用) *
 
 void handle_expression(void)
 {
-	OLED_Clear();                        /* 清GRAM(内部会刷新一次空白) */
+	OLED_ClearBuf();                       /* 只清GRAM不刷新, 避免先闪一帧黑屏 */
 	switch(g_target_expr_id){
 		case EXP_HAPPY: expr_face_happy(); break;
 		case EXP_CRY:   expr_face_cry();   break;
@@ -127,10 +123,20 @@ void handle_reboot(void)
   NVIC_SystemReset();
 }
 
+/* 摇杆步态方向记忆(用于对角模糊区维持上一个动作,避免相位被反复复位) */
+#define GAIT_NONE   0
+#define GAIT_FWD    1
+#define GAIT_BACK   2
+#define GAIT_LEFT   3
+#define GAIT_RIGHT  4
+static u8 s_last_gait = GAIT_NONE;
+
 /* 摇杆指令: dataX=水平(左0~右255), dataY=垂直(后0~前255), 中心约128
- * 改用"带符号偏移+主轴判定": 先取偏离中心更远的主轴决定动作,
- * 斜向滑动不再被固定阈值误判成其他方向(修复右滑Y分量提前命中前后判定、
- * 以及X未超过固定阈值导致右转不触发的问题) */
+ * 采用"带符号偏移 + 主轴判定 + 迟滞":
+ *  - 双轴死区: 播放站立脚本斜坡收腿(不再冻结在步态中间姿态)
+ *  - 主轴判定加迟滞: |adx-ady|<=15 视为对角模糊区, 维持上一个步态,
+ *    避免斜向抖动让主轴在"转向/前后"间来回横跳而反复复位相位(前进顿挫主因之一)
+ *  - 转向需 adx>ady+15(明显水平主导), 前后需 ady>adx+15(明显垂直主导) */
 void handle_joystick(u8 dataX, u8 datay)
 {
 	int dx = (int)dataX - 128;   /* >0 右, <0 左 */
@@ -138,47 +144,48 @@ void handle_joystick(u8 dataX, u8 datay)
 	int adx = (dx < 0) ? -dx : dx;
 	int ady = (dy < 0) ? -dy : dy;
 
-	if (adx < 25 && ady < 25)   /* 双轴都在死区内: 回中停 */
+	if (adx < 25 && ady < 25)   /* 双轴都在死区内: 回中→收腿站立 */
 	{
-		g_action_state = ACTION_IDLE;
-		turn_expr_exit();             /* 停止转弯:表情回正,1s后恢复原表情 */
+		Joy_Stop();                 /* 播放站立脚本,目标角90由斜坡层平滑落位 */
+		turn_expr_exit();           /* 表情回正,1s后恢复原表情 */
+		s_last_gait = GAIT_NONE;
 		return;
 	}
 
-	if (adx > ady)              /* 水平为主: 左转/右转(带表情联动偏移) */
+	if (adx > ady + 15)         /* 水平明显主导: 左转/右转(带表情联动偏移) */
 	{
-		if (dx > 0) {Joy_Right(); turn_expr_enter(10); } /* 右滑→右转:脸右偏10px */
-		else        {Joy_Left();  turn_expr_enter(-10); }  /* 左滑→左转:脸左偏10px */
-	} else {                    /* 垂直为主: 前进/后退 */
-		turn_expr_exit();             /* 非转弯指令:退出联动(若激活则回正计时) */
-		if (dy > 0) { Joy_Up();   }  /* 上推→前进 */
-		else        { Joy_Down(); }  /* 下拉→后退 */
+		if (dx > 0) { Joy_Right(); s_last_gait = GAIT_RIGHT; turn_expr_enter(10);  } /* 右滑→右转:脸右偏10px */
+		else        { Joy_Left();  s_last_gait = GAIT_LEFT;  turn_expr_enter(-10); }  /* 左滑→左转:脸左偏10px */
 	}
-}
-
-/* ==================== 摇头指令 0x21 ====================
- * 通过PB6头舵机(SG90, TIM4_CH1 PWM)执行: 以收到角度为中心左右各摆30°,
- * 往复一次后回到中心角。运行时填充一段RAM脚本交给非阻塞引擎播放,
- * 不卡主循环,5s超时保护照常生效。角度限幅30~150(留足摆动余量) */
-static ServoStep s_scr_heading[5];              /* 运行时填充的摇头脚本 */
-static void Servo_PlayScript(const ServoStep *steps, u8 len, u8 loop); /* 前置声明(定义在后文脚本引擎) */
-
-void handle_heading(u8 angle)
-{
-	ServoStep *sc = s_scr_heading;
-
-	if (angle < 30)  angle = 30;                /* 限幅:保证±30°不撞机械限位 */
-	if (angle > 150) angle = 150;
-
-	sc[0].head = angle - 30;  sc[0].t = 300;    /* 左摆 */
-	sc[1].head = angle + 30;  sc[1].t = 300;    /* 右摆 */
-	sc[2].head = angle - 30;  sc[2].t = 300;    /* 再左摆 */
-	sc[3].head = angle + 30;  sc[3].t = 300;    /* 再右摆 */
-	sc[4].head = angle;       sc[4].t = 200;    /* 回中心角 */
-	/* tail/四腿字段保持static零初始化(=0表示本步不动作) */
-
-	Servo_PlayScript(s_scr_heading, 5, 0);      /* 单次执行,不循环 */
-	printf("heading shake, base angle=%d via PB6\r\n", angle);
+	else if (ady > adx + 15)    /* 垂直明显主导: 前进/后退 */
+	{
+		turn_expr_exit();           /* 非转弯指令:退出联动(若激活则回正计时) */
+		if (dy > 0) { Joy_Up();   s_last_gait = GAIT_FWD;  }  /* 上推→前进 */
+		else        { Joy_Down(); s_last_gait = GAIT_BACK; }  /* 下拉→后退 */
+	}
+	else                        /* 对角模糊区: 维持上一个步态,不切换脚本(保相位) */
+	{
+		switch (s_last_gait)
+		{
+		case GAIT_FWD:   Joy_Up();    break;
+		case GAIT_BACK:  Joy_Down();  break;
+		case GAIT_LEFT:  Joy_Left();  turn_expr_enter(-10); break;
+		case GAIT_RIGHT: Joy_Right(); turn_expr_enter(10);  break;
+		default:                     /* 尚无历史: 按主导轴粗选一次 */
+			if (adx > ady)
+			{
+				if (dx > 0) { Joy_Right(); s_last_gait = GAIT_RIGHT; turn_expr_enter(10);  }
+				else        { Joy_Left();  s_last_gait = GAIT_LEFT;  turn_expr_enter(-10); }
+			}
+			else
+			{
+				turn_expr_exit();
+				if (dy > 0) { Joy_Up();   s_last_gait = GAIT_FWD;  }
+				else        { Joy_Down(); s_last_gait = GAIT_BACK; }
+			}
+			break;
+		}
+	}
 }
 
 
@@ -188,19 +195,20 @@ void handle_heading(u8 angle)
  */
 u8 g_battery_level = 0;
 
-/* 心跳应答:返回状态帧 CMD_STATUS_REPORT(0x41),含电量信息
+/* 心跳应答(收到 CMD_HEARTBEAT 0x01 时触发): 回发真实状态帧 CMD_STATUS_REPORT(0x41)
  * 数据域(4字节): [0]电量%  [1]动作状态  [2]当前表情  [3]通信状态(1=在线)
- */
-void handle_status_req(void)
+ * 除电量(暂未接入 ADC, 保持占位)外, 动作/表情/在线均为实时值 */
+void handle_heartbeat(void)
 {
 	u8 status[4] = {0};
-	status[0] = g_battery_level;              /* 电量百分比(暂为0) */
+	status[0] = g_battery_level;              /* 电量百分比(除外: 暂为0占位) */
 	status[1] = (u8)g_action_state;           /* 当前动作状态 */
 	status[2] = g_current_expr_id;            /* 当前表情ID */
 	status[3] = 1;                            /* 通信状态:能应答即在线 */
-	BLE_SendFrame(CMD_STATUS_REPORT, status, 4);
-	printf("status_req handle, battery=%d%%\r\n", g_battery_level);
+	USART_SendFrame(CMD_STATUS_REPORT, status, 4);
+	printf("heartbeat -> status(action=%d expr=%d online=1)\r\n", status[1], status[2]);
 }
+
 
 ActionState g_action_state = ACTION_IDLE;
 uint32_t    g_action_start_tick = 0;
@@ -255,9 +263,14 @@ static const ServoStep scr_walk_forward[] = {   /* 前进: 对角步态 */
     STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 260),  /* 相1: 对角FL+BR物理后扒推动, FR+BL物理前摆复位 */
     STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  260),  /* 相2: 两组对角互换, 循环推进 */
 };
-static const ServoStep scr_walk_backward[] = {  /* 后退: 对角步态方向取反 */
-    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  260),  /* 相1: 对角FL+BR物理前摆, FR+BL物理后扒 -> 往后推 */
-    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 260),  /* 相2: 两组对角互换 */
+/* 后退: 与前进同一套对角蹭步几何(同样承认是滑步, 不追求抬腿), 仅用两相保持时间
+ * 非对称把净方向偏到后退。实测本机贴地滑步净方向由抓地/机械偏置决定: 单纯镜像或
+ * 调换相位顺序仍是同向循环(原地蹭), 故让"后退驱动相"压久、"前进反推相"快掠过,
+ * 靠持续扒地时间把身体往后顶。前进脚本保持原样不动。
+ * 微调: 后退太弱 -> 拉长相2(如450)、缩短相1(如120); 若反而向前 -> 两相时间对调。 */
+static const ServoStep scr_walk_backward[] = {
+    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  150),  /* 相1: 前进反推相, 短保持快掠过 */
+    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 400),  /* 相2: 后退驱动相, 长保持强化朝后扒地 */
 };
 static const ServoStep scr_turn_right[] = {     /* 右转: 同侧差速原地转 */
     STEP(90,90, L_FWD,  R_BACK, L_FWD,  R_BACK, 300),  /* 相1: 左腿物理前推 + 右腿物理后扒 -> 机身右转 */
@@ -282,28 +295,6 @@ static const ServoStep scr_lie_back[] = {     /* 后躺:前脚向前,后脚向�
     STEP(90,150, 30,150, 30,150, 600),
 };
 
-static const ServoStep scr_shake_head[] = {   /* 摇头 30~120 往复 */
-    STEP(30, 0, 0,0,0,0, 300),
-    STEP(120,0, 0,0,0,0, 300),
-    STEP(30, 0, 0,0,0,0, 300),
-    STEP(120,0, 0,0,0,0, 300),
-    STEP(90, 0, 0,0,0,0, 300),
-};
-static const ServoStep scr_wag_tail[] = {     /* 摇尾 60~120 往复 */
-    STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-    STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-    STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-		STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-    STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-    STEP(0, 40, 0,0,0,0, 150),
-    STEP(0,140, 0,0,0,0, 150),
-    STEP(0, 90, 0,0,0,0, 100),
-};
 static const ServoStep scr_mark[] = {         /* 标记:先坐下,右后腿向后伸 */
     STEP(90,90, 90,90, 90,90, 500),        /* 站 */
     STEP(0, 0,   0, 0,   0, 30,  800),        /* 右后腿向后伸(br=60) */
@@ -355,17 +346,19 @@ static void Servo_PlayScriptTimed(const ServoStep *steps, u8 len, uint32_t durat
     s_script_deadline = g_sys_tick_ms + duration_ms;  /* 回绕安全:判定时用差值 */
 }
 
-/* CMD_ACTION(0x30) 动作码 → 姿势/步态脚本分发 */
+/* CMD_ACTION(0x30) 动作码 → 姿势/步态脚本分发
+ * 所有预定义动作在执行本地脚本的同时, 都把动作帧(CMD_ACTION/act_val)同步发送到 USART3(PB10),
+ * 由下游设备镜像执行同一动作(与摇尾 handle_wag_tail 的转发方式一致) */
 void handle_action_cmd(u8 act_val)
 {
+    USART3_SendFrame(CMD_ACTION, &act_val, 1);   /* 动作指令同步发送给 USART3 */
+    printf("action -> USART3 (act=0x%02X)\r\n", act_val);
     switch (act_val)
     {
     case ACT_STAND:       Servo_PlayScript(scr_stand,       SCRIPT_LEN(scr_stand),       0); break;
     case ACT_SIT_DOWN:    Servo_PlayScript(scr_sit,         SCRIPT_LEN(scr_sit),         0); break;
     case ACT_LIE_FORWARD: Servo_PlayScript(scr_lie_forward, SCRIPT_LEN(scr_lie_forward), 0); break;
     case ACT_LIE_BACK:    Servo_PlayScript(scr_lie_back,    SCRIPT_LEN(scr_lie_back),    0); break;
-    case ACT_SHAKE_HEAD:  Servo_PlayScript(scr_shake_head,  SCRIPT_LEN(scr_shake_head),  0); break;
-    case ACT_WAG_TAIL:    Servo_PlayScript(scr_wag_tail,    SCRIPT_LEN(scr_wag_tail),    0); break;
     case ACT_MARK:        Servo_PlayScript(scr_mark,        SCRIPT_LEN(scr_mark),        0); break;
     case ACT_WAVE:        Servo_PlayScript(scr_handshake,   SCRIPT_LEN(scr_handshake),   0); break;
     /* ---- 预定运动动作: 循环步态跑完20s后自动收腿站立 ---- */
@@ -383,11 +376,81 @@ void handle_action_cmd(u8 act_val)
     }
 }
 
+/* ==================== 抽奖触发(CMD_LOTTERY 0x06) ====================
+ * 1) 停下所有动作(置空闲); 2) 立正: 播放站立脚本由斜坡收腿落位;
+ * 3) 启动 OLED 转盘动画(非阻塞, 由主循环 lottery_poll 逐帧推进,
+ *    动画结束时向 USART3 发送结果帧)。 */
+void handle_lottery_trigger(void)
+{
+    g_action_state = ACTION_IDLE;                         /* 先停当前脚本 */
+    Servo_PlayScript(scr_stand, SCRIPT_LEN(scr_stand), 0); /* 立正: 目标角90, 斜坡落位 */
+    turn_expr_exit();                                     /* 若转弯联动中, 表情回正 */
+    lottery_start();                                      /* 接管 OLED 播放转盘 */
+    printf("lottery start: stop + stand + wheel\r\n");
+}
+
+/* ==================== 单圈抽奖触发(CMD_EXPRESSION 0x31 / data 0x07) ====================
+ * 与 handle_lottery_trigger 同样的"停动作+立正"流程, 但转盘只轮选一轮(6步),
+ * 转完一轮停在"谢谢惠顾"后停止, 结束同样向 USART3 发结果帧。 */
+void handle_lottery_once(void)
+{
+    g_action_state = ACTION_IDLE;                         /* 先停当前脚本 */
+    Servo_PlayScript(scr_stand, SCRIPT_LEN(scr_stand), 0); /* 立正: 目标角90, 斜坡落位 */
+    turn_expr_exit();                                     /* 若转弯联动中, 表情回正 */
+    lottery_start_once();                                 /* 单圈转盘 */
+    printf("lottery once: stop + stand + wheel(1 round)\r\n");
+}
+
+/* 摇尾时把表情临时切为"开心"并持续 5s, 到时自动恢复摇尾前表情(非阻塞, 主循环轮询) */
+static u8       s_wag_expr_active = 0;   /* 开心临时表情进行中 */
+static uint32_t s_wag_expr_until  = 0;   /* 恢复时刻(g_sys_tick_ms) */
+static u8       s_wag_expr_prev   = 0;   /* 进入前正在显示的表情ID */
+
+/* 摇尾执行: 本机尾舵机已移除, 把摇尾动作帧(CMD_ACTION/ACT_WAG_TAIL)同步发送到 USART3(PB10),
+ * 由下游设备(尾驱动/其它模块)完成实际摇尾.
+ * 上位机下发摇尾指令与 PA0 触摸点击都调用此函数.
+ * 同时把表情联动为"开心", 5s 后由 handle_wag_expr 自动恢复. */
+void handle_wag_tail(void)
+{
+	u8 act = ACT_WAG_TAIL;
+	USART3_SendFrame(CMD_ACTION, &act, 1);   /* 摇尾指令同步发送给 USART3 */
+	printf("wag tail -> USART3 (act=0x%02X)\r\n", act);
+
+	/* 摇尾联动: 首次进入记住原表情, 每次摇尾都把开心持续期刷新为 5s */
+	if (!s_wag_expr_active)
+	{
+		s_wag_expr_prev   = g_current_expr_id;  /* 记下摇尾前正在显示的表情 */
+		s_wag_expr_active = 1;
+	}
+	s_wag_expr_until = g_sys_tick_ms + 5000u;
+	if (g_target_expr_id != EXP_HAPPY)
+	{
+		g_target_expr_id = EXP_HAPPY;
+		g_expr_dirty     = 1;                    /* 置脏, 由主循环 expression_poll 刷新 */
+	}
+}
+
+/* 开心临时表情到期恢复: 主循环每轮调用, 摇尾满 5s 后回到摇尾前表情(非阻塞) */
+void handle_wag_expr(void)
+{
+	if (!s_wag_expr_active)
+		return;
+	if ((int32_t)(g_sys_tick_ms - s_wag_expr_until) < 0)
+		return;                                  /* 未到 5s */
+	s_wag_expr_active = 0;
+	if (g_target_expr_id == EXP_HAPPY)           /* 期间未被用户手动切走才恢复 */
+	{
+		g_target_expr_id = s_wag_expr_prev;
+		g_expr_dirty     = 1;
+	}
+}
+
 /* ---- 摇杆手势→步态接口(手势方向 = 物理运动方向) ---- */
 void Joy_Up(void)    { Servo_PlayScript(scr_walk_forward,  SCRIPT_LEN(scr_walk_forward),  1); }  /* 上推→前进 */
 void Joy_Down(void)  { Servo_PlayScript(scr_walk_backward, SCRIPT_LEN(scr_walk_backward), 1); }  /* 下拉→后退 */
 void Joy_Left(void)  { Servo_PlayScript(scr_turn_left,     SCRIPT_LEN(scr_turn_left),     1); }  /* 左滑→左转 */
 void Joy_Right(void) { Servo_PlayScript(scr_turn_right,    SCRIPT_LEN(scr_turn_right),    1); }  /* 右滑→右转 */
+void Joy_Stop(void)  { Servo_PlayScript(scr_stand,         SCRIPT_LEN(scr_stand),         0); }  /* 回中→收腿站立(单次,斜坡落位) */
 
 /* ==================== 非阻塞动作执行器 ==================== */
 /*
@@ -396,6 +459,11 @@ void Joy_Right(void) { Servo_PlayScript(scr_turn_right,    SCRIPT_LEN(scr_turn_r
  */
 u8 handle_action(void)
 {
+    /* 斜坡层每轮主循环推进一次(内部按 SERVO_RAMP_TICK_MS 节流):
+     * 无论脚本处于哪种状态, 都把各轴向目标角平滑逼近, 消除硬跳变;
+     * 空闲/回中时也让腿平滑收到站立角 */
+    Servo_RampTick();
+
     switch (g_action_state)
     {
     case ACTION_IDLE:
@@ -439,91 +507,6 @@ u8 handle_action(void)
     }
 }
 
-/* ==================== 灯效联动(不动蓝牙协议,本地推断) ====================
- * 不加新定时器/中断: 每轮主循环算一次"目标灯效", 只在发生变化时才调
- * WS2812_SetMode(内部阻塞发完首帧,8灯约240us), 之后的流水/呼吸/闪烁仍由
- * 主循环 WS2812_Tick() 非阻塞推进, 不影响步态相位与心跳应答
- *
- * 判定优先级: 睡觉表情 > 通信报警 > 步态运动 > 其余表情 > 其余时间
- *   睡觉排在报警前面: 10min无通信会自动进睡眠表情,若不排前面就会红闪一整夜
- *   "运动"只指四足步态(摇杆前进/后退/左转/右转 及 20s 预定运动动作);
- *   坐下/趴下/摇头/摇尾/标记/握手 这类单次姿势不算,走表情色
- * 颜色为"基准色", 实际输出还要再乘全局亮度 s_brightness(默认128,约一半),
- *   所以"暗绿/暗蓝"直接用小数值的基准色即可
- */
-enum {
-	LT_MOVE = 0,     /* 步态运动: 蓝色闪烁 */
-	LT_ALARM,        /* 通信中断报警: 红色闪烁 */
-	LT_SLEEP,        /* 表情-睡觉: 暗绿呼吸 */
-	LT_ANGRY,        /* 表情-生气: 橙色快速流水 */
-	LT_CRY,          /* 表情-哭泣: 暗蓝常亮 */
-	LT_HAPPY,        /* 表情-开心: 七彩闪烁 */
-	LT_IDLE          /* 其余时间: 蓝色常亮 */
-};
-
-static u8 s_light_last      = 0xFF;  /* 0xFF=上电后还没设过灯效(保证首次必上灯) */
-static u8 s_light_seen_comm = 0;     /* 本次上电后是否建立过通信(避免开机就报警) */
-
-static void light_apply(u8 st)
-{
-	switch (st)
-	{
-	case LT_MOVE:                                /* 运动: 蓝色闪烁(亮125ms+灭125ms) */
-		WS2812_SetAllMode(WS2812_MODE_FLASH,   0,   0, 255, 250);
-		break;
-	case LT_ALARM:                               /* 通信中断: 红色闪烁 */
-		WS2812_SetAllMode(WS2812_MODE_FLASH, 255,   0,   0, WS2812_PERIOD_FLASH);
-		break;
-	case LT_SLEEP:                               /* 睡觉: 暗绿呼吸 */
-		WS2812_SetAllMode(WS2812_MODE_BREATH,  0,  90,   0, WS2812_PERIOD_BREATH);
-		break;
-	case LT_ANGRY:                               /* 生气: 橙色快速流水(8灯一圈约0.48s) */
-		WS2812_SetAllMode(WS2812_MODE_FLOW,  255, 120,   0, 60);
-		break;
-	case LT_CRY:                                 /* 哭泣: 暗蓝常亮 */
-		WS2812_SetAllMode(WS2812_MODE_ON,      0,   0,  90, 0);
-		break;
-	case LT_HAPPY:                               /* 开心: 七彩闪烁(七色走一圈约2.1s) */
-		WS2812_SetAllMode(WS2812_MODE_RAINBOW, 255,   0,   0, WS2812_PERIOD_RAINBOW);
-		break;
-	case LT_IDLE:                                /* 其余: 蓝色常亮 */
-	default:
-		WS2812_SetAllMode(WS2812_MODE_ON,      0,   0, 255, 0);
-		break;
-	}
-}
-
-/* comm_elapsed_ms: 距最近一次收到有效帧(心跳/正确指令)的时长,由主循环传入 */
-void handle_light(u32 comm_elapsed_ms)
-{
-	u8 want;
-
-	if (comm_elapsed_ms < 5000) s_light_seen_comm = 1;   /* 通信建立过,之后才允许报警 */
-
-	if (g_current_expr_id == EXP_SLEEP)
-		want = LT_SLEEP;                                /* 睡觉: 暗绿呼吸,不被报警覆盖 */
-	else if (s_light_seen_comm && comm_elapsed_ms >= 5000)
-		want = LT_ALARM;                                /* 5s 无有效帧: 红色闪烁报警 */
-	else if (g_action_state == ACTION_SCRIPT &&
-	    (s_script == scr_walk_forward || s_script == scr_walk_backward ||
-	     s_script == scr_turn_left    || s_script == scr_turn_right))
-		want = LT_MOVE;                                 /* 只有四足步态算"运动" */
-	else switch (g_current_expr_id)                     /* 其余看表情 */
-	{
-		case EXP_ANGRY: want = LT_ANGRY; break;
-		case EXP_CRY:   want = LT_CRY;   break;
-		case EXP_HAPPY: want = LT_HAPPY; break;
-		default:        want = LT_IDLE;  break;         /* NORMAL/发呆/未知 */
-	}
-
-	if (want == s_light_last) return;                   /* 灯效未变: 不发消息不占时间 */
-	printf("LIGHT %u->%u comm=%u act=%u expr=%u\r\n",
-	       (unsigned)s_light_last, (unsigned)want, (unsigned)comm_elapsed_ms,
-	       (unsigned)g_action_state, (unsigned)g_current_expr_id);
-	s_light_last = want;
-	light_apply(want);
-}
-
 /* 表情轮播测试: 依次展示6个表情,每个3秒 */
 void Expression_Test(void)
 {
@@ -543,18 +526,18 @@ void Expression_Test(void)
  {
 	//Servo_Head(0);   // PB1 头 占空比2.5%，0度
 	//Servo_Tail(0);   // PB7 尾巴 占空比2.5%，0度
-	Servo_Leg_FL(0);  // PB8 左前脚
+	//Servo_Leg_FL(0);  // PB8 左前脚
     //Servo_Leg_FR(0);  // PB6 右前脚
   //Servo_Leg_BL(0);  // PB9 左后脚
-   // Servo_Leg_BR(0);  // PB0 右后脚
+    Servo_Leg_BR(0);  // PB0 右后脚
 	delay_ms(1000);
 	  LED0 = !LED0;
 	//Servo_Head(60); // PB1 头 占空比7.5%，90度
 	//Servo_Tail(60); // PB7 尾巴 占空比7.5%，90度
-	Servo_Leg_FL(60);  // PB8 左前脚
+	//Servo_Leg_FL(60);  // PB8 左前脚
    // Servo_Leg_FR(60);  // PB6 右前脚
    //Servo_Leg_BL(60);  // PB9 左后脚
-   // Servo_Leg_BR(60);  // PB0 右后脚
+    Servo_Leg_BR(60);  // PB0 右后脚
 	delay_ms(1000); 
 	 LED0 = !LED0;
  }
@@ -575,16 +558,6 @@ void Expression_Test(void)
 	delay_ms(700);
 }
 
-void Memory_Test(void)
-{
-		u8 *p=0;
-		u8 i=10;
-		p=mymalloc(SRAMIN,2048);//2
-		if(p!=NULL)sprintf((char*)p,"Memory Malloc Test%03d",i);
-		printf("%s\r\n",p);
-		myfree(SRAMIN,p);
-	  p=0;
-}
 
 void USART2_Test(void)
 {

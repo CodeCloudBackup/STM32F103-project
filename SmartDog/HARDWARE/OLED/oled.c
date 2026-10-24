@@ -1,5 +1,4 @@
 #include "oled.h"
-#include "spi.h"
 #include "delay.h"
 #include "oledfont.h"
 #include <stdio.h> 
@@ -7,22 +6,46 @@
 
 static u8 OLED_GRAM[128][8];	
 
-/* ========== ?????? ========== */
+/* ==================== SSD1306 软件 I2C 时序 (PB8=SCL, PB9=SDA) ====================
+ * 开漏输出 + 外部上拉: 写1=释放总线(被上拉拉高), 写0=主动拉低
+ * 纯写器件, 不读取从机 ACK(释放 SDA 期间从机拉低不会与主机冲突)
+ */
+static void i2c_delay(void)
+{
+	delay_us(2);           // 约 100~200kHz 软 I2C 半周期
+}
 
-// PB10 RST      复位 拉低时初始化（复位），正常时拉高
-// PB11 DC       命令/数据
-// PB14 NSS/CS	  片选	拉低选中
+static void OLED_I2C_Start(void)
+{
+	OLED_SDA_HIGH();
+	OLED_SCL_HIGH();
+	i2c_delay();
+	OLED_SDA_LOW();        // SCL 高电平时 SDA 下降沿 = START
+	i2c_delay();
+	OLED_SCL_LOW();
+	i2c_delay();
+}
+
+static void OLED_I2C_Stop(void)
+{
+	OLED_SDA_LOW();
+	OLED_SCL_HIGH();
+	i2c_delay();
+	OLED_SDA_HIGH();       // SCL 高电平时 SDA 上升沿 = STOP
+	i2c_delay();
+}
+
 void OLED_Init(void)
 {
 	GPIO_InitTypeDef GPIO_InitStructure;
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);//配置GPIOB时钟	
-	//软件引脚
-	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
-	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10|GPIO_Pin_11|GPIO_Pin_14;;//首先采用软件片选
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);//配置GPIOB时钟
+	// SCL(PB8)/SDA(PB9): 开漏输出, 依赖模块上拉电阻
+	GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_Out_OD;
+	GPIO_InitStructure.GPIO_Pin   = GPIO_Pin_8 | GPIO_Pin_9;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_2MHz;
-	GPIO_Init(GPIOB,&GPIO_InitStructure);//先执行一下软件端口的初始化
-	SPI2_Init();		   	//SPI2初始化
-	GPIO_SetBits(GPIOB, GPIO_Pin_14); 
+	GPIO_Init(GPIOB, &GPIO_InitStructure);
+	OLED_SCL_HIGH();       // 总线空闲: 两线释放为高
+	OLED_SDA_HIGH();
 	// 显示屏初始化流程
 	OLED_Reset();
 	// 关闭显示
@@ -82,35 +105,46 @@ void OLED_Init(void)
 
 void OLED_Reset(void)
 {
-	OLED_RST_HIGH();
-	delay_ms(100);
-	OLED_RST_LOW();
-	delay_ms(100);
-	OLED_RST_HIGH();
-	delay_ms(100);
+	delay_ms(100);           // 无硬件 RST 引脚: 仅作为上电稳定延时
 }
 
 void OLED_Send_Byte(u8 byte)
 {
-	OLED_CS_LOW();                                       // 拉低片选，D/C#在下降沿被锁存，决定本字节是命令还是数据
-	while(SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_TXE)==RESET);
-	SPI_I2S_SendData(SPI2, byte);
-	while(SPI_I2S_GetFlagStatus(SPI2, SPI_I2S_FLAG_BSY)==SET);  // 等待移位结束
-	OLED_CS_HIGH();                                      // 释放片选，形成每字节的帧边界
+	u8 i;
+	for(i=0;i<8;i++)                                     // MSB先行, 逐位敲出
+	{
+		if(byte & 0x80) OLED_SDA_HIGH();                 // 在 SCL 低电平期间准备数据
+		else            OLED_SDA_LOW();
+		byte <<= 1;
+		i2c_delay();
+		OLED_SCL_HIGH();                                 // SCL 上升沿锁存数据
+		i2c_delay();
+		OLED_SCL_LOW();
+	}
+	OLED_SDA_HIGH();                                     // 释放 SDA, 让从机回 ACK
+	i2c_delay();
+	OLED_SCL_HIGH();                                     // 第9个时钟给出 ACK 槽
+	i2c_delay();
+	OLED_SCL_LOW();
+	i2c_delay();
 }
 
-void OLED_WR_Cmd(u8 cmd) 
+void OLED_WR_Cmd(u8 cmd)
 {
-	OLED_DC_LOW();
+	OLED_I2C_Start();
+	OLED_Send_Byte(SSD1306_I2C_ADDR);                    // 器件地址 + 写
+	OLED_Send_Byte(0x00);                                // 控制字节: Co=0, D/C#=0 => 命令
 	OLED_Send_Byte(cmd);
-	OLED_DC_HIGH();
+	OLED_I2C_Stop();
 }
 
 void OLED_WR_Byte(u8 dat)
 {
-	OLED_DC_HIGH();
+	OLED_I2C_Start();
+	OLED_Send_Byte(SSD1306_I2C_ADDR);                    // 器件地址 + 写
+	OLED_Send_Byte(0x40);                                // 控制字节: Co=0, D/C#=1 => 数据
 	OLED_Send_Byte(dat);
-	OLED_DC_HIGH();
+	OLED_I2C_Stop();
 }
 
 void OLED_Color_Turn(u8 flag)
@@ -158,8 +192,13 @@ void OLED_Refresh(void)
         OLED_WR_Cmd(0xB0 + i);
         OLED_WR_Cmd(0x02);       // 列地址低4位=2(SH1106可视区从GDRAM列2开始)
         OLED_WR_Cmd(0x10);       // 列地址高4位
-				for (n=0; n< 128; n++)
-					OLED_WR_Byte(OLED_GRAM[n][i]);
+				/* 整页 128 字节合入一次 I2C 事务: 只在页头发 地址+控制0x40, 省去每字节的 Start/Stop 开销(~3倍提速) */
+				OLED_I2C_Start();
+				OLED_Send_Byte(SSD1306_I2C_ADDR);
+				OLED_Send_Byte(0x40);
+				for (n = 0; n < 128; n++)
+					OLED_Send_Byte(OLED_GRAM[n][i]);
+				OLED_I2C_Stop();
     }
 }	
 
@@ -177,6 +216,15 @@ void OLED_Clear(void)
 }
 
 // 
+/* 仅清零 GRAM 缓存, 不刷新到屏: 供"先清缓冲->绘图->一次刷新"使用, 避免中间黑屏闪烁 */
+void OLED_ClearBuf(void)
+{
+	uint8_t i, n;
+	for (i = 0; i < 8; i++)
+		for (n = 0; n < 128; n++)
+			OLED_GRAM[n][i] = 0;
+}
+
 void OLED_SetContrast(uint8_t value)
 {
     OLED_WR_Cmd(SSD1306_SET_CONTRAST);

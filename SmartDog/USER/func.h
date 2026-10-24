@@ -7,10 +7,7 @@
 #include "led.h"
 #include "oled.h"
 #include "servo.h"
-#include "ws2812.h"
-#include "malloc.h"
-#include "ble_uart.h"
-#include "ble_protocol.h"
+#include "usart_protocol.h"
 
 
 /* ==================== 动作状态机定义 ==================== */
@@ -33,21 +30,24 @@ extern u8 g_action_param;
 void handle_leg_reset(void);				/* 四足复位处理 */
 void handle_reboot(void);						/* 软重启指令处理*/
 void handle_joystick(u8 dataX, u8 dataY);   	/* 遥杆移动指令处理*/
-void handle_heading(u8 angle);		  /* 摇头指令处理 函数入参传递*/
 u8 handle_action(void);   					/* 自定义动作指令处理 全局参数传递*/
 void handle_action_cmd(u8 act_val);  /* CMD_ACTION动作码分发,启动对应脚本 */
+void handle_lottery_trigger(void);   /* CMD_LOTTERY(0x06): 停所有动作+立正+启动抽奖转盘动画(非阻塞) */
+void handle_lottery_once(void);      /* CMD_EXPRESSION(0x31/0x07): 同上但转盘只轮选一轮, 转完停在谢谢惠顾 */
 /* 摇杆四个手势对应的步态接口(名字=手势,循环执行,直到新指令或5s超时停止):
  * Joy_Right=右滑前进  Joy_Left=左滑后退  Joy_Up=上推右转  Joy_Down=下拉左转 */
 void Joy_Right(void);
 void Joy_Left(void);
 void Joy_Up(void);
 void Joy_Down(void);
+void Joy_Stop(void);              /* 回中:播放站立脚本,斜坡收腿 */
 void handle_expression(void);				/* 表情调度:分发绘制并刷新 全局参数传递*/
 void handle_expr_return(void);   /* 转弯停止1s后恢复原表情的轮询(主循环每轮调用) */
-void handle_status_req(void);
+void handle_heartbeat(void);    /* CMD_HEARTBEAT(0x01)应答: 回发真实状态帧 CMD_STATUS_REPORT(电量除外) */
 void handle_sleep(void);						/* 待机:停止动作并进入睡眠表情 */
 void handle_timeout_guard(u32 *last_valid_tick); /* 通信超时保护:5s停动作/10min待机 */
-void handle_light(u32 comm_elapsed_ms);     /* 灯效联动:按动作/表情/通信状态自动切换(主循环每轮调用) */
+void handle_wag_tail(void);   /* 摇尾执行:把摇尾动作帧同步发送到 USART3, 并把表情联动为开心(5s 后自动恢复) */
+void handle_wag_expr(void);   /* 开心临时表情满 5s 后恢复原表情的轮询(主循环每轮调用) */
 
 //////////////////////////
 void Memory_Test(void);

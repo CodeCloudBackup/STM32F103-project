@@ -3,12 +3,12 @@
 
 #include "sys.h"
 
-//OLED�����ú���
+//OLED�����ú���
 /* ==================== */
 #define OLED_WIDTH          128     // ????(??)
 #define OLED_HEIGHT         64      // ????(??)
 #define OLED_PAGE_NUM       8       // ??(HEIGHT/8)
-#define OLED_BUFFER_SIZE    1024    // ????(128�64/8)
+#define OLED_BUFFER_SIZE    1024    // ????(128�64/8)
 /* ========== SSD1306 ?????? ========== */
 #define SSD1306_DISPLAY_OFF             0xAE
 #define SSD1306_DISPLAY_ON              0xAF   //点亮屏幕
@@ -32,15 +32,15 @@
 #define SSD1306_CLOSE_CHARGE_PUMP       0x10	//关闭电荷泵
 #define SSD1306_OPEN_CHARGE_PUMP        0x14	//开启电荷泵
 
-// PB10 RST      复位
-// PB11 DC       命令/数据
-// PB12 NSS/CS	  片选	
-#define OLED_RST_LOW()  GPIO_ResetBits(GPIOB, GPIO_Pin_10);
-#define OLED_RST_HIGH() GPIO_SetBits(GPIOB, GPIO_Pin_10);
-#define OLED_DC_LOW()  GPIO_ResetBits(GPIOB, GPIO_Pin_11);
-#define OLED_DC_HIGH() GPIO_SetBits(GPIOB, GPIO_Pin_11);
-#define OLED_CS_LOW() 	GPIO_ResetBits(GPIOB, GPIO_Pin_14);
-#define OLED_CS_HIGH() 	GPIO_SetBits(GPIOB, GPIO_Pin_14);
+/* ==================== SSD1306 软件 I2C 引脚 ====================
+ * PB8 = SCL, PB9 = SDA (开漏输出 + 外部上拉), 无 RST 引脚
+ * 注意: PB8/PB9 原为左前/左后脚舵机(TIM4_CH3/CH4), 已被 OLED I2C 占用
+ */
+#define SSD1306_I2C_ADDR      0x78       // 7位地址 0x3C<<1, 末位为写
+#define OLED_SCL_HIGH()  GPIO_SetBits(GPIOB,   GPIO_Pin_8)
+#define OLED_SCL_LOW()   GPIO_ResetBits(GPIOB, GPIO_Pin_8)
+#define OLED_SDA_HIGH()  GPIO_SetBits(GPIOB,   GPIO_Pin_9)
+#define OLED_SDA_LOW()   GPIO_ResetBits(GPIOB, GPIO_Pin_9)
 
 
 void OLED_Init(void);
@@ -54,6 +54,7 @@ void OLED_Display_On(void);
 void OLED_Display_Off(void);
 void OLED_Refresh(void); 
 void OLED_Clear(void);
+void OLED_ClearBuf(void);   /* 仅清GRAM不刷新, 配合一次刷新避免黑屏闪烁 */
 void OLED_SetContrast(uint8_t value);
 void OLED_DrawPoint(u8 x,u8 y,u8 t);
 void OLED_DrawCircle(uint8_t x, uint8_t y, uint8_t r);
