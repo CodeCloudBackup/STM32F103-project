@@ -59,12 +59,19 @@ typedef enum {
     EXP_NORMAL  = 0x05,  /* 正常: 圆角正方形双眼(追加,不影响旧ID) */
 } ExpressionType;
 
+/* ==================== 帧来源标识(防 USART3 回弹死循环) ====================
+ * 解析出的帧携带来路: 仅当指令来自 USART1(蓝牙/上位机)时才向 USART3 转发镜像帧;
+ * 来自 USART3(语音模块)的指令不再回发, 打断"模块→MCU→模块"回显环 */
+#define USART_SRC_U1   1u     /* 来自 USART1(PA9/PA10): 上位机/蓝牙 */
+#define USART_SRC_U3   3u     /* 来自 USART3(PB10/PB11): 语音模块 */
+
 /* ==================== 解析结果结构体 ==================== */
 typedef struct {
     uint8_t  cmd;
     uint8_t  data[USART_MAX_DATA];
     uint8_t  data_len;
     uint8_t  valid;   /* 1=有效帧, 0=无效 */
+    uint8_t  src;     /* 帧来源: USART_SRC_U1 / USART_SRC_U3 */
 } ParsedFrame;
 
 /* ==================== 解析状态机状态 ==================== */

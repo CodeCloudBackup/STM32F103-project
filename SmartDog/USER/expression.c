@@ -105,6 +105,7 @@ static void expr_clear_above(int xa, int xb, int lx0, int ly0, int lx1, int ly1)
 	}
 }
 
+#if 0                                             /* Z字仅旧睡觉表情使用,已停用 */
 /* 字母Z: 左上角(x,y), 边长s, 上横-斜线-下横三笔,线厚t */
 static void expr_Z(int x, int y, int s, int t)
 {
@@ -112,17 +113,24 @@ static void expr_Z(int x, int y, int s, int t)
 	expr_line_thick(x , y, x+ s, y+ s , t);          /* 斜线 */
 	expr_line_thick(x, y + s, x + s, y + s, t);      /* 下横 */
 }
+#endif
 
-/* 凸上凹下弧形条(眼笑成拱): 宽=2w, 每列上/下边界都是椭圆弧(半宽w,半高h);
- * t=弯条竖直半厚, (cx,cy)=边缘列中心 */
-static void expr_smile_band(int cx, int cy, int w, int h, int t)
+/* 弧形条(dir=1上拱∩/dir=0下凹∪): 半宽w, 弧跨度由弧高hp控制: hp=w·tan(θ/2);
+ * 凸弧半高hp, 凹弧半高q(可单独控制弧度), 两弧包络填充; (cx,cy)=两端尖点基线 */
+static void expr_arc_band(int cx, int cy, int w, int hp, int q, int dir)
 {
-	int dx, dy, s;
+	int dx, dy, s, s2;
 	for(dx = -w; dx <= w; dx++){
-		for(s = h; w*w*s*s > h*h*(w*w - dx*dx); s--);  /* 椭圆: (dx/w)²+(s/h)²=1 */
-		for(dy = -t; dy <= t; dy++)
-			expr_dot(cx + dx, cy - s + dy);
+		for(s = hp; w*w*s*s > hp*hp*(w*w - dx*dx); s--);   /* 凸弧 */
+		for(s2 = q; w*w*s2*s2 > q*q*(w*w - dx*dx); s2--);  /* 凹弧 */
+		for(dy = -(s > s2 ? s : s2); dy <= -(s < s2 ? s : s2); dy++)   /* 两弧交叉, 取上下包络 */
+			expr_dot(cx + dx, dir ? cy + dy : cy - dy);   /* dir=0时垂直镜像 */
 	}
+}
+
+static void expr_smile_band(int cx, int cy, int w, int hp)
+{
+	expr_arc_band(cx, cy, w, hp, hp/4, 1);        /* 开心: 正∩弯月笑眼, 凹弧为凸弧1/4 */
 }
 
 /* ==================== 大眼表情(已去除嘴巴与Zzz) ====================
@@ -135,10 +143,10 @@ void expr_face_normal(void)        /* 正常: 两个实心圆角正方形眼睛(
 	expr_round_square_fill(90 + g_expr_shift, 34, 20, 4);  /* 右眼 */
 }
 
-void expr_face_happy(void)         /* 开心: 矮弧笑眼(宽保持20,弧高缩小) */
+void expr_face_happy(void)         /* 开心: 弧形笑眼, w=20 hp=16 → 下弧张角约77° */
 {
-	expr_smile_band(32, 34, 20, 14, 4);             /* 左眼: w=20 h=12 t=4 */
-	expr_smile_band(90, 34, 20, 14, 4);             /* 右眼 */
+	expr_smile_band(32, 34, 20, 16);             /* 左眼: 半宽20 弧高16 */
+	expr_smile_band(90, 34, 20, 16);             /* 右眼 */
 }
 
 void expr_face_cry(void)           /* 哭泣: 15高X20宽圆角矩形眼 + 囧形拱眉 + 左眼下一滴小泪 */
@@ -171,13 +179,17 @@ void expr_face_angry(void)         /* 生气: 圆角方块眼(与正常同款) +
 	expr_line_thick(77, 28, 77, 36, 1);           /* 右眉内端下勾 */
 }
 
-void expr_face_sleep(void)         /* 睡觉: 两条粗闭眼横线 + 右上角递减三个Z字 */
+void expr_face_sleep(void)         /* 睡觉: 两条向下的下凹弧闭眼(等长等弧度) */
 {
+	expr_arc_band(32, 34, 20, 18, 14, 0);              /* 左眼: ∪下凹, 下弧下移5px→等厚5px弧条 */
+	expr_arc_band(90, 34, 20, 18, 14, 0);              /* 右眼: 与左眼等长等弧度 */
+#if 0                                             /* ---- 旧实现: 两条粗横线+Zzz ---- */
 	expr_round_rect_fill(70, 45, 12, 3, 2);                   /* 左闭眼 粗长 */
 	expr_round_rect_fill(100, 45, 12, 3, 2);                  /* 右闭眼 粗长 */
 	expr_Z(15, 2,  13, 1);                                  /* 大Z */
 	expr_Z(35, 17, 9,  1);                                  /* 中Z */
 	expr_Z(50, 28, 6,  0);                                  /* 小z */
+#endif
 }
 
 /* ====================================================================
@@ -397,8 +409,8 @@ void lottery_poll(void)
 		}
 	} else if (s_lot_phase == 2) {
 		if (g_sys_tick_ms - s_lot_done_tick >= LOT_DONE_MS) {
-			u8 code = 0x06;
-			USART3_SendFrame(CMD_EXPRESSION, &code, 1); /* AA 55 31 01 06 37 0D 0A */
+			u8 code = 0x07;
+			USART3_SendFrame(CMD_EXPRESSION, &code, 1); /* AA 55 31 01 07 38 0D 0A */
 			s_lot_active = 0;
 			s_lot_phase  = 0;
 			g_expr_dirty = 1;   /* 请求回位表情, 由主机循环 expression_poll 刷新 */

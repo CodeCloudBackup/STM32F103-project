@@ -11,6 +11,7 @@
 extern u8 g_current_expr_id;   /* 当前已显示的表情ID */
 extern u8 g_expr_dirty;        /* 脏标记:1=有新表情待刷新 */
 extern u8 g_target_expr_id;    /* 目标表情ID(ExpressionType) */
+extern u8 g_suppress_expr_fwd; /* 抑制锁:1=本次表情变化不回发USART3(语音模块来源), 由expression_poll消费 */
 extern signed char g_expr_shift; /* 正常表情眼睛水平偏移px(转弯联动) */
 
 /* 表情绘制函数: 只写入GRAM,不刷新,由调用方控制刷新时机 */

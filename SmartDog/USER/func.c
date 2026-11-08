@@ -18,6 +18,7 @@ void handle_leg_reset(void)
 u8 g_current_expr_id = 0;
 u8 g_expr_dirty = 0;
 u8 g_target_expr_id = 0;
+u8 g_suppress_expr_fwd = 0;   /* 抑制锁:置1后下一次表情变化不回发USART3, 由 expression_poll 消费 */
 signed char g_expr_shift = 0;   /* 正常表情水平偏移px(转弯联动用) */
 
 void handle_expression(void)
@@ -225,60 +226,41 @@ u8     g_action_param = 0;
 #define SCRIPT_LEN(a)  ((u8)(sizeof(a) / sizeof((a)[0])))
 
 /* ---- 运动(循环步态) ----
- * ==================== 四足运动原理 ====================
- * 每条腿只有 1 个自由度（髋部前/后摆）, 无膝关节抬升。
- * 前进/后退靠“向后的腿扒地推身体”产生推力, 循环交替相位实现连续运动。
- * 角度约定(原始逻辑角, 底层自动叠加各腿安装补偿):
- *   120=数值大于90的方向, 60=数值小于90的方向
- *   实际物理方向由下方 L_FWD/L_BACK/R_FWD/R_BACK 按左右镜像关系给出
- *   STEP 字段顺序: (头, 尾, 左前FL, 右前FR, 左后BL, 右后BR, 保持ms)
- *
- * 【关键: 左右舵机安装方向镜像相反】
- *   实测同一原始角度值, 左腿向前摆时右腿向后摆(安装方向相反),
- *   故脚本里必须按腿区分写值: 左腿"前摆"=120, 右腿"前摆"=60(取反)。
- *   站立中位90不受影响(镜像中心即90), 各腿补偿仍由底层叠加。
- *
- * 【前进/后退 = 对角步态(trot)】
- *   将“左前+右后”(一对对角)与“右前+左后”(另一对对角)分组,
- *   两组始终反向摆动: 一组扒地时另一组前摆复位。对角支撑形成稳定三角,
- *   身体不侧翻。后退只需把两组的扒地/前摆方向整体取反。
- *
- * 【左转/右转 = 同侧差速(scrub turn)】
- *   改为按“左侧两腿 / 右侧两腿”分组, 两侧物理反向摆动:
- *   一侧前推、另一侧后扒, 两侧力矩方向相反 -> 机身原地旋转。
- *   右转: 左腿前推 + 右腿后扒; 左转: 右腿前推 + 左腿后扒。
- *   (跟前进的区别就在于分组方式: 对角=直走, 同侧=转向)
+ * 逐拍复刻 servo-n/Movement.c 的可行序列(45/90/135), 0=本步保持.
+ * 字段顺序 STEP(头,尾,FL左前,FR右前,BL左后,BR右后,ms);
+ * 通道对应: FL=Angle4, FR=Angle2, BL=Angle3, BR=Angle1.
  */
-#define LEG_FWD   120   /* 逻辑角: 数值大于90 */
-#define LEG_BACK   60   /* 逻辑角: 数值小于90 */
-#define LEG_MID    90   /* 中位/站立 */
-
-/* 按安装镜像关系区分左右腿的"物理方向"写值 */
-#define L_FWD    LEG_FWD    /* 左腿(FL/BL): 向前摆 -> 120 */
-#define L_BACK   LEG_BACK   /* 左腿(FL/BL): 向后摆 -> 60  */
-#define R_FWD    LEG_BACK   /* 右腿(FR/BR): 向前摆 -> 60  (安装反向,数值取反) */
-#define R_BACK   LEG_FWD    /* 右腿(FR/BR): 向后摆 -> 120 (安装反向,数值取反) */
-
-static const ServoStep scr_walk_forward[] = {   /* 前进: 对角步态 */
-    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 260),  /* 相1: 对角FL+BR物理后扒推动, FR+BL物理前摆复位 */
-    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  260),  /* 相2: 两组对角互换, 循环推进 */
+static const ServoStep scr_walk_forward[] = {   /* 前进: 复刻 move_forward(8拍) */
+    STEP(90,90,  45,  0,   0,  135, 150),
+    STEP(90,90,   0,  45, 135,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
+    STEP(90,90,   0, 135,  45,   0, 150),
+    STEP(90,90, 135,  0,   0,   45, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
 };
-/* 后退: 与前进同一套对角蹭步几何(同样承认是滑步, 不追求抬腿), 仅用两相保持时间
- * 非对称把净方向偏到后退。实测本机贴地滑步净方向由抓地/机械偏置决定: 单纯镜像或
- * 调换相位顺序仍是同向循环(原地蹭), 故让"后退驱动相"压久、"前进反推相"快掠过,
- * 靠持续扒地时间把身体往后顶。前进脚本保持原样不动。
- * 微调: 后退太弱 -> 拉长相2(如450)、缩短相1(如120); 若反而向前 -> 两相时间对调。 */
-static const ServoStep scr_walk_backward[] = {
-    STEP(90,90, L_FWD,  R_BACK, L_BACK, R_FWD,  150),  /* 相1: 前进反推相, 短保持快掠过 */
-    STEP(90,90, L_BACK, R_FWD,  L_FWD,  R_BACK, 400),  /* 相2: 后退驱动相, 长保持强化朝后扒地 */
+static const ServoStep scr_walk_backward[] = {  /* 后退: 复刻 move_behind(8拍) */
+    STEP(90,90, 135,  0,   0,   45, 150),
+    STEP(90,90,   0, 135,  45,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
+    STEP(90,90,   0,  45, 135,   0, 150),
+    STEP(90,90,  45,  0,   0,  135, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
 };
-static const ServoStep scr_turn_right[] = {     /* 右转: 同侧差速原地转 */
-    STEP(90,90, L_FWD,  R_BACK, L_FWD,  R_BACK, 300),  /* 相1: 左腿物理前推 + 右腿物理后扒 -> 机身右转 */
-    STEP(90,90, L_BACK, R_FWD,  L_BACK, R_FWD,  300),  /* 相2: 两侧回摆复位, 持续旋转力矩 */
+static const ServoStep scr_turn_right[] = {     /* 右转: 复刻 move_right(4拍) */
+    STEP(90,90,  45,  0,   0,   45, 150),
+    STEP(90,90,   0, 135, 135,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
 };
-static const ServoStep scr_turn_left[] = {      /* 左转: 同侧差速原地转 */
-    STEP(90,90, L_BACK, R_FWD,  L_BACK, R_FWD,  300),  /* 相1: 右腿物理前推 + 左腿物理后扒 -> 机身左转 */
-    STEP(90,90, L_FWD,  R_BACK, L_FWD,  R_BACK, 300),  /* 相2: 两侧回摆复位 */
+static const ServoStep scr_turn_left[] = {      /* 左转: 复刻 move_left(4拍) */
+    STEP(90,90,   0, 135, 135,   0, 150),
+    STEP(90,90,  45,  0,   0,   45, 150),
+    STEP(90,90,   0,  90,  90,   0, 150),
+    STEP(90,90,  90,  0,   0,   90, 150),
 };
 
 /* ---- 姿势(单次执行) ---- */
@@ -288,24 +270,30 @@ static const ServoStep scr_stand[] = {        /* 站立 */
 static const ServoStep scr_sit[] = {          /* 坐下:后腿前收 */
     STEP(90,90, 90,90, 30,150, 600),
 };
-static const ServoStep scr_lie_forward[] = {  /* 趴下:前脚向前,后脚向后 */
-    STEP(120,90, 150,30, 150,30, 600),
+static const ServoStep scr_lie_forward[] = {  /* 趴下:前脚向前,后脚向后(头低尾翘加大,四肢伸平,躯干更水平) */
+    STEP(135,135, 160,20, 160,20, 600),
 };
-static const ServoStep scr_lie_back[] = {     /* 后躺:前脚向前,后脚向前 */
-    STEP(90,150, 30,150, 30,150, 600),
+static const ServoStep scr_lie_back[] = {     /* 后躺:前脚向前,后脚向前(头仰尾翘加大,四肢伸平,躯干更水平) */
+    STEP(45,135, 20,160, 20,160, 600),
 };
 
-static const ServoStep scr_mark[] = {         /* 标记:先坐下,右后腿向后伸 */
+static const ServoStep scr_mark[] = {         /* 标记:先坐下,右后腿向后伸(伸腿保持加长,全程约5s) */
     STEP(90,90, 90,90, 90,90, 500),        /* 站 */
-    STEP(0, 0,   0, 0,   0, 30,  800),        /* 右后腿向后伸(br=60) */
-    STEP(0, 0,   0, 0,   0,90,  400),        /* 收回 */
+    STEP(0, 0,   0, 0,   0, 30,  2800),       /* 右后腿向后伸并保持(br=60) */
+    STEP(0, 0,   0, 0,   0,90,  500),        /* 收回 */
 };
-static const ServoStep scr_handshake[] = {    /* 握手:左前腿向前伸 */
-    STEP(90,90, 90, 90, 90,90, 300),         /* 先站定 */
-    STEP(0, 0, 30,  0,  0,  0, 700),         /* 左前腿前伸 */
-    STEP(0, 0, 60,  0,  0,  0, 300),         /* 轻摆 */
-    STEP(0, 0, 30,  0,  0,  0, 300),
-    STEP(0, 0,  90,  0,  0,  0, 300),         /* 收回 */
+static const ServoStep scr_handshake[] = {    /* 招手:先坐下(后腿前收),再左前腿前伸抬高上下晃动,最后收腿站起(全程约6.6s) */
+    STEP(90,90, 90,90, 160, 20, 800),        /* 坐下:后腿前收(左后160/右后20, 各比原 150/30 再远离站立位 10 度),留足落位时间 */
+    STEP(90,90, 90,90, 160, 20, 300),        /* 保持坐姿稳定,再进入招手 */
+    STEP(0, 0, 1,  0,  0,  0, 800),         /* 左前腿前伸并抬高(目标近0度=最高点;用 1 避开 0=保持 的约定) */
+    STEP(0, 0, 45,  0,  0,  0, 350),         /* 晃动1: 放下 */
+    STEP(0, 0, 1,  0,  0,  0, 350),         /* 晃动2: 抬起 */
+    STEP(0, 0, 45,  0,  0,  0, 350),         /* 晃动3: 放下 */
+    STEP(0, 0, 1,  0,  0,  0, 350),         /* 晃动4: 抬起 */
+    STEP(0, 0, 45,  0,  0,  0, 350),         /* 晃动5: 放下 */
+    STEP(0, 0, 1,  0,  0,  0, 350),         /* 晃动6: 抬起 */
+    STEP(0, 0, 90,  0,  0,  0, 400),         /* 左前腿收回 */
+    STEP(90,90, 90, 90, 90,90, 600),         /* 后腿放下,恢复站立收位 */
 };
 
 /* ---- 脚本播放游标(文件内部) ---- */
@@ -316,7 +304,9 @@ static u8   s_script_loop = 0;
 static uint32_t s_step_tick = 0;
 static uint32_t s_script_deadline = 0;  /* 循环步态的停止时刻(0=不限时:摇杆持续指令/单次姿势) */
 
-#define PRESET_MOVE_MS  20000u          /* 预定运动动作时长 20s */
+#define PRESET_WALK_MS  5000u           /* 预定前进/后退动作时长 5s */
+#define PRESET_TURN_MS  10000u          /* 预定左转/右转动作时长 10s */
+#define WAG_WALK_MS     1500u           /* 摇尾/触摸联动的前进行走时长 3s(到期自动收腿站立) */
 
 /* 播放一段脚本;loop=1循环(步态),loop=0执行一遍后回空闲
  * 若已在播放同一循环脚本(摇杆持续同方向),不重置相位 */
@@ -347,12 +337,19 @@ static void Servo_PlayScriptTimed(const ServoStep *steps, u8 len, uint32_t durat
 }
 
 /* CMD_ACTION(0x30) 动作码 → 姿势/步态脚本分发
- * 所有预定义动作在执行本地脚本的同时, 都把动作帧(CMD_ACTION/act_val)同步发送到 USART3(PB10),
- * 由下游设备镜像执行同一动作(与摇尾 handle_wag_tail 的转发方式一致) */
-void handle_action_cmd(u8 act_val)
+ * 来路上位机(USART1)的动作: 执行本地脚本的同时把动作帧(CMD_ACTION/act_val)同步发送到 USART3(PB10),
+ * 由下游设备镜像执行(与摇尾 handle_wag_tail 同); 来自 USART3(语音模块)的指令不回弹, 避免回显死循环 */
+void handle_action_cmd(u8 act_val, u8 src)
 {
-    USART3_SendFrame(CMD_ACTION, &act_val, 1);   /* 动作指令同步发送给 USART3 */
-    printf("action -> USART3 (act=0x%02X)\r\n", act_val);
+    if (src != USART_SRC_U3)
+    {
+        USART3_SendFrame(CMD_ACTION, &act_val, 1);   /* 动作指令同步发送给 USART3 */
+        printf("action -> USART3 (act=0x%02X)\r\n", act_val);
+    }
+    else
+    {
+        printf("action from USART3, no bounce (act=0x%02X)\r\n", act_val);
+    }
     switch (act_val)
     {
     case ACT_STAND:       Servo_PlayScript(scr_stand,       SCRIPT_LEN(scr_stand),       0); break;
@@ -361,14 +358,14 @@ void handle_action_cmd(u8 act_val)
     case ACT_LIE_BACK:    Servo_PlayScript(scr_lie_back,    SCRIPT_LEN(scr_lie_back),    0); break;
     case ACT_MARK:        Servo_PlayScript(scr_mark,        SCRIPT_LEN(scr_mark),        0); break;
     case ACT_WAVE:        Servo_PlayScript(scr_handshake,   SCRIPT_LEN(scr_handshake),   0); break;
-    /* ---- 预定运动动作: 循环步态跑完20s后自动收腿站立 ---- */
-    case ACT_MOVE_FORWARD: Servo_PlayScriptTimed(scr_walk_forward,  SCRIPT_LEN(scr_walk_forward),  PRESET_MOVE_MS);
+    /* ---- 预定运动动作: 循环步态跑完限时后自动收腿站立(前进/后退5s, 左转/右转10s) ---- */
+    case ACT_MOVE_FORWARD: Servo_PlayScriptTimed(scr_walk_forward,  SCRIPT_LEN(scr_walk_forward),  PRESET_WALK_MS);
                         break;
-    case ACT_MOVE_BACK:    Servo_PlayScriptTimed(scr_walk_backward, SCRIPT_LEN(scr_walk_backward), PRESET_MOVE_MS);
+    case ACT_MOVE_BACK:    Servo_PlayScriptTimed(scr_walk_backward, SCRIPT_LEN(scr_walk_backward), PRESET_WALK_MS);
                         break;
-    case ACT_TURN_LEFT:    Servo_PlayScriptTimed(scr_turn_left,     SCRIPT_LEN(scr_turn_left),     PRESET_MOVE_MS);
+    case ACT_TURN_LEFT:    Servo_PlayScriptTimed(scr_turn_left,     SCRIPT_LEN(scr_turn_left),     PRESET_TURN_MS);
                         break;
-    case ACT_TURN_RIGHT:   Servo_PlayScriptTimed(scr_turn_right,    SCRIPT_LEN(scr_turn_right),    PRESET_MOVE_MS);
+    case ACT_TURN_RIGHT:   Servo_PlayScriptTimed(scr_turn_right,    SCRIPT_LEN(scr_turn_right),    PRESET_TURN_MS);
                         break;
     default:
         printf("No program for action 0x%02X\r\n", act_val);
@@ -405,16 +402,24 @@ void handle_lottery_once(void)
 static u8       s_wag_expr_active = 0;   /* 开心临时表情进行中 */
 static uint32_t s_wag_expr_until  = 0;   /* 恢复时刻(g_sys_tick_ms) */
 static u8       s_wag_expr_prev   = 0;   /* 进入前正在显示的表情ID */
+static u8       s_wag_expr_src    = 0;   /* 本次摇尾来源:USART_SRC_U3时切开心/恢复都不回发语音模块 */
 
 /* 摇尾执行: 本机尾舵机已移除, 把摇尾动作帧(CMD_ACTION/ACT_WAG_TAIL)同步发送到 USART3(PB10),
  * 由下游设备(尾驱动/其它模块)完成实际摇尾.
  * 上位机下发摇尾指令与 PA0 触摸点击都调用此函数.
- * 同时把表情联动为"开心", 5s 后由 handle_wag_expr 自动恢复. */
-void handle_wag_tail(void)
+ * 本机联动两件事: 1) 前进小跑 3s(到期由 handle_action 自动收腿站立);
+ *                 2) 表情切为"开心", 5s 后由 handle_wag_expr 自动恢复. */
+void handle_wag_tail(u8 src)
 {
 	u8 act = ACT_WAG_TAIL;
-	USART3_SendFrame(CMD_ACTION, &act, 1);   /* 摇尾指令同步发送给 USART3 */
-	printf("wag tail -> USART3 (act=0x%02X)\r\n", act);
+	if (src != USART_SRC_U3)   /* 来自 USART3(语音模块)的摇尾不回弹, 避免回显死循环 */
+	{
+		USART3_SendFrame(CMD_ACTION, &act, 1);   /* 摇尾指令同步发送给 USART3 */
+		printf("wag tail -> USART3 (act=0x%02X)\r\n", act);
+	}
+
+	/* 摇尾联动行走: 前进 3s(重复摇尾/触摸只刷新到期时刻, 不打断步态相位) */
+	Servo_PlayScriptTimed(scr_walk_forward, SCRIPT_LEN(scr_walk_forward), WAG_WALK_MS);
 
 	/* 摇尾联动: 首次进入记住原表情, 每次摇尾都把开心持续期刷新为 5s */
 	if (!s_wag_expr_active)
@@ -422,11 +427,14 @@ void handle_wag_tail(void)
 		s_wag_expr_prev   = g_current_expr_id;  /* 记下摇尾前正在显示的表情 */
 		s_wag_expr_active = 1;
 	}
+	s_wag_expr_src = src;                        /* 记下来源, 供 5s 恢复时判断是否回发 */
 	s_wag_expr_until = g_sys_tick_ms + 5000u;
 	if (g_target_expr_id != EXP_HAPPY)
 	{
 		g_target_expr_id = EXP_HAPPY;
 		g_expr_dirty     = 1;                    /* 置脏, 由主循环 expression_poll 刷新 */
+		if (src == USART_SRC_U3)
+			g_suppress_expr_fwd = 1;             /* 语音模块来的摇尾: 拉抑制锁, expression_poll 不回发开心 */
 	}
 }
 
@@ -442,6 +450,8 @@ void handle_wag_expr(void)
 	{
 		g_target_expr_id = s_wag_expr_prev;
 		g_expr_dirty     = 1;
+		if (s_wag_expr_src == USART_SRC_U3)
+			g_suppress_expr_fwd = 1;             /* 语音模块摇尾的恢复表情同样不回发 */
 	}
 }
 

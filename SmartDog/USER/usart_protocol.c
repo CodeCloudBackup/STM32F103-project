@@ -285,10 +285,11 @@ static u8 proto_poll(UsartProto *p, ParsedFrame *frame)
     return 0;
 }
 
-/* ==================== 对外轮询: 先解析 USART1, 再 USART3 ==================== */
+/* ==================== 对外轮询: 先解析 USART1, 再 USART3 ====================
+ * 解析成功后回填 frame->src 标记来路, 供上层判断是否需向 USART3 转发 */
 u8 USART_PollFrame(ParsedFrame *frame)
 {
-    if (proto_poll(&s_u1, frame)) return 1;
-    if (proto_poll(&s_u3, frame)) return 1;
+    if (proto_poll(&s_u1, frame)) { frame->src = USART_SRC_U1; return 1; }
+    if (proto_poll(&s_u3, frame)) { frame->src = USART_SRC_U3; return 1; }
     return 0;
 }

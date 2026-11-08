@@ -10,8 +10,9 @@
  *           表情指令(CMD_EXPRESSION)经脏标记+轮询真正刷新到 OLED,
  *           表情ID实际变化时同步把 CMD_EXPRESSION 帧发送到 USART3,
  *           摇尾指令(CMD_ACTION/ACT_WAG_TAIL)与 PA0 触摸点击都把动作帧转发到 USART3,
+ *           并在本机联动"前进 3s + 开心表情 5s",
  *           其余预定动作指令(CMD_ACTION)由 handle_action_cmd 启动姿势/步态脚本,
- *           主循环 handle_action 非阻塞逐步执行(预定运动 20s 后自动收腿站立),
+ *           主循环 handle_action 非阻塞逐步执行(预定运动限时后自动收腿站立:前进/后退5s, 转向10s),
  *           也不直接打印原始命令字节
  *   注意: 字符串字面量只用 ASCII(Keil/ARMCC 按 GBK 读取 UTF-8 源文件时,
  *         中文字符串可能产生 0x5C 破坏右引号); 中文注释不受影响
@@ -57,18 +58,24 @@ static const char *expr_name(u8 e)
  * 遵循"脏标记 + 主循环轮询"约定: 收到表情指令只置目标与脏标记,
  * 真正的清屏/绘制/刷新放到 expression_poll 中执行, 避免阻塞命令解析
  */
-/* 请求切换表情: 记录目标ID并置脏标记(已是该表情则不重复刷新) */
-static void expression_request(u8 expr_id)
+/* 来自 USART3(语音模块)的表情指令不回弹: 一次抑制锁存(g_suppress_expr_fwd, 定义在func.c),
+ * 由 expression_poll 消费, 避免"模块→MCU→模块"表情回显循环; 摇尾联动也复用同一锁 */
+
+/* 请求切换表情: 记录目标ID并置脏标记(已是该表情则不重复刷新);
+ * src=USART_SRC_U3 时置抑制锁, 使本次变化不回发 USART3 */
+static void expression_request(u8 expr_id, u8 src)
 {
 	if (g_target_expr_id == expr_id && g_current_expr_id == expr_id)
 		return;
 	g_target_expr_id = expr_id;
 	g_expr_dirty     = 1;
+	if (src == USART_SRC_U3)
+		g_suppress_expr_fwd = 1;
 }
 
 /* 表情变化执行: 若有脏标记则绘制并刷新到 OLED, 更新当前表情ID;
  * 表情ID确有变化时同步把 CMD_EXPRESSION 帧发送到 USART3(与摇尾转发同格式);
- * 仅眼睛偏移变化(ID不变)不重复发送 */
+ * 仅眼睛偏移变化(ID不变)不重复发送; 来自USART3的变化消费一次抑制锁而不回发 */
 static void expression_poll(void)
 {
 	u8 prev_expr_id;
@@ -81,8 +88,16 @@ static void expression_poll(void)
 	g_expr_dirty      = 0;
 	if (g_current_expr_id != prev_expr_id)
 	{
-		USART3_SendFrame(CMD_EXPRESSION, &g_current_expr_id, 1);  /* 表情切换指令同步发送给 USART3 */
-		usart1_printf("expr 0x%02X -> USART3\r\n", g_current_expr_id);
+		if (g_suppress_expr_fwd)
+		{
+			g_suppress_expr_fwd = 0;     /* 来自语音模块的回显: 不回弹, 打断循环 */
+			usart1_printf("expr 0x%02X from USART3, no bounce\r\n", g_current_expr_id);
+		}
+		else
+		{
+			USART3_SendFrame(CMD_EXPRESSION, &g_current_expr_id, 1);  /* 表情切换指令同步发送给 USART3 */
+			usart1_printf("expr 0x%02X -> USART3\r\n", g_current_expr_id);
+		}
 	}
 }
 
@@ -125,8 +140,11 @@ static void report_operation(const ParsedFrame *f)
 
 	case CMD_JOYSTICK:
 		if (f->data_len >= 2)
+		{
 			usart1_printf("OP: joystick -> %s (X=%d,Y=%d)\r\n",
 				joystick_op(f->data[0], f->data[1]), f->data[0], f->data[1]);
+			handle_joystick(f->data[0], f->data[1]);   /* 真正执行: 按坐标切换步态脚本(joystick_op 仅供打印描述) */
+		}
 		else
 			usart1_printf("OP: joystick data too short to parse\r\n");
 		break;
@@ -140,9 +158,9 @@ static void report_operation(const ParsedFrame *f)
 		{
 			usart1_printf("OP: exec action -> %s\r\n", action_name(f->data[0]));
 			if (f->data[0] == ACT_WAG_TAIL)
-				handle_wag_tail();   /* 摇尾: 本机无尾舵机, 把动作帧同步发送到 USART3 */
+				handle_wag_tail(f->src);   /* 摇尾: 本机无尾舵机, 把动作帧同步发送到 USART3(src=U3时不回弹); 本机前进3s+开心表情 */
 			else
-				handle_action_cmd(f->data[0]);  /* 预定动作: 启动脚本, 由 handle_action 轮询执行 */
+				handle_action_cmd(f->data[0], f->src);  /* 预定动作: 启动脚本(src=U3时不回弹) */
 		}
 		else
 			usart1_printf("OP: action data too short to parse\r\n");
@@ -154,17 +172,21 @@ static void report_operation(const ParsedFrame *f)
 			if (f->data[0] == 0x06)        /* AA 55 31 01 06 37 0D 0A: 抽奖(3圈) */
 			{
 				usart1_printf("OP: lottery -> stop + stand + wheel\r\n");
+				if (f->src == USART_SRC_U1)
+					USART3_SendFrame(CMD_EXPRESSION, &f->data[0], 1);  /* 蓝牙来的抽奖触发帧先转发语音模块, 结束再由动画发结果帧 */
 				handle_lottery_trigger();
 			}
 			else if (f->data[0] == 0x07)   /* AA 55 31 01 07 38 0D 0A: 抽奖(单圈,转完停在谢谢惠顾) */
 			{
 				usart1_printf("OP: lottery once -> stop + stand + wheel(1 round)\r\n");
+				if (f->src == USART_SRC_U1)
+					USART3_SendFrame(CMD_EXPRESSION, &f->data[0], 1);  /* 同上: 蓝牙来的单圈抽奖触发帧转发语音模块 */
 				handle_lottery_once();
 			}
 			else
 			{
 				usart1_printf("OP: switch expression -> %s\r\n", expr_name(f->data[0]));
-				expression_request(f->data[0]);   /* 真正切换到 OLED(轮询中刷新) */
+				expression_request(f->data[0], f->src);   /* 真正切换到 OLED(轮询中刷新); src=U3时不回弹 */
 			}
 		}
 		else
@@ -187,9 +209,13 @@ static void report_operation(const ParsedFrame *f)
 	}
 }
 
+/* 指令接收"地板"间隔: 处理完一帧后, 20ms 内到达的帧直接丢弃(仍继续排空环形缓冲防溢出), 防洪泛/连发 */
+#define CMD_FLOOR_MS  20u
+
 int main(void)
 {
 	ParsedFrame frame;
+	u32 last_cmd_tick = 0;   /* 上次真正处理指令帧的时刻(ms) */
 
 	// 中断优先级分组2: 2位抢占优先级 + 2位响应优先级
 	NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
@@ -213,6 +239,10 @@ int main(void)
 		// 轮询解析收到的完整协议帧(USART1 为本演示的命令输入源)
 		while (USART_PollFrame(&frame))
 		{
+			/* 20ms 地板: 距上次处理不足则丢弃该帧(但循环继续 pop 以排空缓冲), 防止指令过快 */
+			if ((u32)(g_sys_tick_ms - last_cmd_tick) < CMD_FLOOR_MS)
+				continue;
+			last_cmd_tick = g_sys_tick_ms;
 			// 先解析数据含义, 再打印需要执行的操作
 			report_operation(&frame);
 		}
@@ -224,7 +254,7 @@ int main(void)
 			handle_wag_expr();     // 摇尾开心表情满 5s 则恢复原表情(置脏, 下一句刷新)
 			expression_poll();     // 有待刷新表情时非阻塞更新 OLED
 			if (touch_poll())      // PA0 触摸一次有效点击(已消抖/合并连击)
-				handle_wag_tail(); // 执行摇尾指令(同步发送给 USART3)
+				handle_wag_tail(USART_SRC_U1); // 本地触发: 摇尾指令同步发送给 USART3, 本机前进3s
 		}
 	}
 }
